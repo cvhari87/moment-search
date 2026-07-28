@@ -26,11 +26,15 @@ _URI_RE = re.compile(r"^https?://\S+$")
 _KINDS = ("paper", "deck")
 
 
-def _doc_id(uri: str) -> str:
-    """Deterministic from the URI (like yt_<video_id> is deterministic from a
-    YouTube URL) — re-registering the same URI updates the same row instead
-    of piling up duplicates."""
-    return "doc_" + hashlib.sha256(uri.encode()).hexdigest()[:12]
+def _doc_id(user_id: str, uri: str) -> str:
+    """Deterministic from (user_id, uri) — re-registering the same URI as the
+    SAME user updates that one row instead of piling up duplicates. Scoped by
+    user_id (unlike yt_<video_id>, which the video path leaves unscoped — a
+    pre-existing gap there, not one to newly copy here): hashing the URI alone
+    would let two different users collide on one manifest row, silently
+    handing one tenant's document to another (upsert_pending's ON CONFLICT
+    never re-checks or updates user_id)."""
+    return "doc_" + hashlib.sha256(f"{user_id}:{uri}".encode()).hexdigest()[:12]
 
 
 class RegisterDocument(BaseModel):
@@ -47,7 +51,7 @@ def register_document(req: RegisterDocument, uid: str = Depends(user_id)):
     if not _URI_RE.match(uri):
         raise HTTPException(400, "uri must be http(s) — fetchability is checked "
                                  "during ingestion, not at registration time.")
-    doc_id = _doc_id(uri)
+    doc_id = _doc_id(uid, uri)
     row = db.upsert_pending({
         "id": doc_id, "user_id": uid, "source": "document",
         "url": None, "storage_key": None, "source_hash": uri,
@@ -64,7 +68,7 @@ def register_document(req: RegisterDocument, uid: str = Depends(user_id)):
 _SOURCE_FIELDS = _PUBLIC_FIELDS + ("kind", "uri", "chunk_count")
 
 
-@router.get("/sources")
+@router.get("/sources", dependencies=[Depends(require_auth)])
 def list_sources(uid: str = Depends(user_id)):
     rows = db.list_videos(uid)
     out = []

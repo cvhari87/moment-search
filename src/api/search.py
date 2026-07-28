@@ -21,7 +21,11 @@ from .videos import require_auth, user_id as user_id_dep
 router = APIRouter(tags=["search"])
 
 UI_DIR = Path(__file__).resolve().parents[2] / "ui"
-CORPUS_DIR = config.DATA / "corpus"
+# Tracked fixture (not under data/, which is gitignored runtime/user data) —
+# must survive a fresh clone, CI, and the Fly image, or the deck query has
+# nothing to retrieve. See corpus/one-index-for-every-source-deck.html for
+# the editable source.
+CORPUS_DIR = config.ROOT / "corpus"
 _FRAME_RE = re.compile(r"^\d{6}\.jpg$")
 _USER_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _CORPUS_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}\.pdf$")

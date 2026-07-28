@@ -23,6 +23,10 @@ qdrant_storage/
 *.mp4
 *.mov
 *.mkv
+# Exception: our own authored corpus fixture (source HTML + rendered PDF) is
+# project content, not user-uploaded media — it must survive a fresh clone,
+# CI, and the Fly image, or the deck query has nothing to retrieve.
+!corpus/*.pdf
 
 # Model caches
 .cache/

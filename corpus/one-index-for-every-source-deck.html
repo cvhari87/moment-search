@@ -1,0 +1,110 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<style>
+  @page { size: 297mm 167mm; margin: 0; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: Helvetica, Arial, sans-serif; color: #1a1a2e; }
+  .slide {
+    width: 297mm; height: 167mm; padding: 16mm 20mm;
+    page-break-after: always; position: relative; overflow: hidden;
+  }
+  .slide:last-child { page-break-after: avoid; }
+  h1 { font-size: 34pt; margin: 0 0 6mm 0; color: #0f3460; }
+  h2 { font-size: 26pt; margin: 0 0 8mm 0; color: #0f3460; border-bottom: 3px solid #e94560; padding-bottom: 4mm; }
+  .kicker { font-size: 13pt; color: #e94560; letter-spacing: 2px; text-transform: uppercase; margin-bottom: 4mm; }
+  .sub { font-size: 16pt; color: #555; margin-top: 4mm; }
+  ul { font-size: 16pt; line-height: 1.6; }
+  li { margin-bottom: 4mm; }
+  .footer { position: absolute; bottom: 10mm; left: 20mm; font-size: 10pt; color: #999; }
+  .center { display: flex; flex-direction: column; justify-content: center; height: 100%; }
+  .row { display: flex; gap: 12mm; margin-top: 6mm; }
+  .col { flex: 1; background: #f5f6fa; border-radius: 6px; padding: 8mm; }
+  .col h3 { font-size: 15pt; color: #0f3460; margin: 0 0 3mm 0; }
+  .col p, .col li { font-size: 12.5pt; }
+  .big { font-size: 22pt; font-weight: bold; color: #0f3460; text-align: center; margin: 10mm 0; }
+  code { background: #eee; padding: 1mm 2mm; border-radius: 3px; font-size: 12pt; }
+</style></head>
+<body>
+
+<div class="slide center">
+  <div class="kicker">Moment Search at Scale</div>
+  <h1>One Index for Every Source</h1>
+  <div class="sub">Turning a video-only moment search product into a multi-source knowledge engine:<br>
+  talks, research papers, and slide decks — one queue, one index, one answer with citations.</div>
+  <div class="footer">Assignment 3 · Architecture Deck</div>
+</div>
+
+<div class="slide">
+  <h2>The Problem</h2>
+  <ul>
+    <li>Existing system: <b>video-only</b>. Ingests YouTube talks, indexes frames + transcript, answers with timestamped citations.</li>
+    <li>Real knowledge lives across <b>three kinds of source</b>: talks, papers, slide decks.</li>
+    <li>Users want <b>one question, cited moments across every source</b> — the video timestamp <i>and</i> the paper page <i>and</i> the deck slide.</li>
+  </ul>
+  <div class="footer">Assignment 3 · Architecture Deck</div>
+</div>
+
+<div class="slide">
+  <h2>Two Queue Layers, Not One</h2>
+  <div class="row">
+    <div class="col">
+      <h3>Layer 1 — WFQ Scheduler (Postgres)</h3>
+      <p>Sources sit <code>pending</code> in the manifest. A background thread admits at most <code>DISPATCH_MAX_INFLIGHT</code> at a time, round-robin across users, via an atomic <code>UPDATE ... WHERE status='pending' RETURNING</code>.</p>
+      <p>Stops one bulk uploader from starving everyone else.</p>
+    </div>
+    <div class="col">
+      <h3>Layer 2 — Prefect Cloud</h3>
+      <p>Once admitted, the API fires a deployment run; workers long-poll over outbound HTTPS.</p>
+      <p>An orchestrator, not a broker — retries and a run dashboard. Fairness is entirely Layer 1's job.</p>
+    </div>
+  </div>
+  <div class="footer">Assignment 3 · Architecture Deck</div>
+</div>
+
+<div class="slide center">
+  <h2 style="border:none;">The Core Design Decision</h2>
+  <div class="big">One shared vector index for every source.</div>
+  <ul>
+    <li>Video transcript chunks, paper pages, and deck slides all land in the <b>same text collection</b> — not three separate indexes.</li>
+    <li>Retrieval is one nearest-neighbor query; results are fused and grouped by source afterward, not before.</li>
+    <li>One query can surface a video moment, a paper page, and a deck slide side by side — they were never split apart to begin with.</li>
+    <li>A new source kind = a new payload field, not a new index.</li>
+  </ul>
+  <div class="footer">Assignment 3 · Architecture Deck</div>
+</div>
+
+<div class="slide">
+  <h2>Locators Across Kinds</h2>
+  <div class="row">
+    <div class="col"><h3>Video</h3><p>Citation locator: <code>{start_ms, end_ms}</code>. Deep link seeks the player to the exact moment.</p></div>
+    <div class="col"><h3>Paper</h3><p>Citation locator: <code>{page}</code>. Deep link opens the PDF to the cited page.</p></div>
+    <div class="col"><h3>Deck</h3><p>Citation locator: <code>{slide}</code>. Deep link opens the deck to the cited slide.</p></div>
+  </div>
+  <p class="sub">Every citation carries <code>kind</code> + <code>locator</code> + <code>text</code> — grounded, not fabricated. Empty retrieval returns empty citations, never an invented one.</p>
+  <div class="footer">Assignment 3 · Architecture Deck</div>
+</div>
+
+<div class="slide">
+  <h2>Resilience Is Application-Owned</h2>
+  <ul>
+    <li>Ingestion checkpoints at every stage: parse → chunk → embed/upsert, each committed as a durable artifact before the status advances.</li>
+    <li>A staleness sweep resets any source stuck mid-flight past a threshold back to <code>pending</code> — the dispatcher fairly re-admits it, and a new run resumes from the last committed checkpoint.</li>
+    <li>Deterministic point IDs make redelivery safe: re-running embed/upsert never duplicates.</li>
+    <li>We don't assume Prefect's own crash detection guarantees "0 dropped" — our own reconciler does.</li>
+  </ul>
+  <div class="footer">Assignment 3 · Architecture Deck</div>
+</div>
+
+<div class="slide center">
+  <h2 style="border:none;">Why a Queue at All</h2>
+  <div class="sub" style="font-size:18pt; text-align:center;">
+    Search is latency-critical and read-only.<br>
+    Ingestion is bursty and heavy — OCR, captioning, embedding hundreds of chunks.<br><br>
+    Share a process and one backfill starves every user.<br>
+    The queue makes the admin API trivial: validate, insert, enqueue, <code>202</code> —<br>
+    while workers drain at their own pace, measured, not assumed.
+  </div>
+  <div class="footer">Assignment 3 · Architecture Deck</div>
+</div>
+
+</body></html>
