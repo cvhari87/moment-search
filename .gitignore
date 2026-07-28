@@ -17,6 +17,13 @@ data/
 backend/data/
 qdrant_storage/
 
+# Source media / documents (papers, decks, videos) — never committed, wherever they land
+*.pdf
+*.pptx
+*.mp4
+*.mov
+*.mkv
+
 # Model caches
 .cache/
 *.pt
@@ -25,9 +32,6 @@ qdrant_storage/
 # Node / frontend
 node_modules/
 dist/
-
-# Benchmark
-benchmark/
 
 # Internal design notes (not published)
 MULTIMODAL_RETRIEVAL.md
