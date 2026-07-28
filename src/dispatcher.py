@@ -36,7 +36,10 @@ def dispatch_once() -> int:
     claimed = db.wfq_claim(slots)
     for row in claimed:
         try:
-            jobs.enqueue_video(row["id"], row["user_id"])
+            if row.get("kind", "video") == "video":
+                jobs.enqueue_video(row["id"], row["user_id"])
+            else:
+                jobs.enqueue_document(row["id"], row["user_id"], row["kind"])
         except Exception as exc:
             # Couldn't reach Prefect — put it back so it's retried next tick.
             db.set_status(row["id"], "pending", error=f"dispatch: {exc}")

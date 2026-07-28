@@ -67,27 +67,59 @@ CREATE TABLE IF NOT EXISTS ms_user_llms (
     api_key    TEXT,                            -- optional (vLLM often has none)
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Multi-source manifest migration: one shared table for every source kind
+-- (video | paper | deck), not a second table — this is what lets the WFQ
+-- dispatcher and wfq_claim() generalize to documents with zero rewrite.
+-- ADD COLUMN IF NOT EXISTS is idempotent whether the table is brand new or
+-- already has rows; the DEFAULT keeps every pre-existing video row valid.
+ALTER TABLE ms_videos ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'video';
+ALTER TABLE ms_videos ADD COLUMN IF NOT EXISTS uri TEXT;
+ALTER TABLE ms_videos ADD COLUMN IF NOT EXISTS chunk_count INT;
+CREATE INDEX IF NOT EXISTS ms_videos_kind_idx ON ms_videos (kind);
 """
+
+# Advisory-lock key for schema init. Arbitrary but stable — must not collide
+# with other pg_advisory_lock callers in this Postgres instance.
+_SCHEMA_LOCK_KEY = 833271
 
 
 def init_schema() -> None:
+    """Both api and worker call this independently at boot. Without
+    coordination, concurrent first-time `CREATE TABLE IF NOT EXISTS` calls can
+    race on Postgres's own system catalogs — observed in practice as
+    `UniqueViolation: duplicate key ... pg_type_typname_nsp_index`, not just a
+    theoretical risk. A container restart policy can mask the crash (the loser
+    just retries and finds the table already there), which makes it look safe
+    when it isn't.
+
+    pg_advisory_xact_lock is transaction-scoped: it's held for exactly the
+    connection block below and releases automatically on commit OR rollback,
+    so a crash mid-migration can never leave the lock stuck.
+    """
     with pool().connection() as conn:
+        conn.execute("SELECT pg_advisory_xact_lock(%s)", (_SCHEMA_LOCK_KEY,))
         conn.execute(SCHEMA)
 
 
 def upsert_pending(video: dict[str, Any]) -> dict:
-    """Insert a video as pending; re-submitting an existing id resets it."""
+    """Insert a source (video, paper, or deck) as pending; re-submitting an
+    existing id resets it. `kind` defaults to 'video' so every existing
+    caller (src/api/videos.py) works unchanged; documents pass kind + uri."""
+    video = {"kind": "video", "uri": None, **video}
     with pool().connection() as conn:
         row = conn.execute(
             """
-            INSERT INTO ms_videos (id, user_id, source, url, storage_key, source_hash, title, status)
+            INSERT INTO ms_videos (id, user_id, source, url, storage_key, source_hash,
+                                   title, kind, uri, status)
             VALUES (%(id)s, %(user_id)s, %(source)s, %(url)s, %(storage_key)s,
-                    %(source_hash)s, %(title)s, 'pending')
+                    %(source_hash)s, %(title)s, %(kind)s, %(uri)s, 'pending')
             ON CONFLICT (id) DO UPDATE SET
                 url = COALESCE(EXCLUDED.url, ms_videos.url),
                 storage_key = COALESCE(EXCLUDED.storage_key, ms_videos.storage_key),
                 source_hash = COALESCE(EXCLUDED.source_hash, ms_videos.source_hash),
                 title = COALESCE(EXCLUDED.title, ms_videos.title),
+                uri = COALESCE(EXCLUDED.uri, ms_videos.uri),
                 status = 'pending', error = NULL, progress = NULL, updated_at = now()
             RETURNING *
             """,
@@ -99,7 +131,7 @@ def upsert_pending(video: dict[str, Any]) -> dict:
 def set_status(video_id: str, status: str, *, error: str | None = None,
                title: str | None = None, frame_count: int | None = None,
                source_hash: str | None = None, embed_version: str | None = None,
-               progress: float | None = None) -> None:
+               progress: float | None = None, chunk_count: int | None = None) -> None:
     with pool().connection() as conn:
         conn.execute(
             """
@@ -109,11 +141,12 @@ def set_status(video_id: str, status: str, *, error: str | None = None,
                 source_hash = COALESCE(%s, source_hash),
                 embed_version = COALESCE(%s, embed_version),
                 progress = %s,
+                chunk_count = COALESCE(%s, chunk_count),
                 updated_at = now()
             WHERE id = %s
             """,
             (status, error, title, frame_count, source_hash, embed_version,
-             progress, video_id),
+             progress, chunk_count, video_id),
         )
 
 
@@ -219,7 +252,7 @@ def wfq_claim(limit: int) -> list[dict]:
             """
             UPDATE ms_videos SET status = 'queued', updated_at = now()
             WHERE id = ANY(%s) AND status = 'pending'
-            RETURNING id, user_id
+            RETURNING id, user_id, kind
             """,
             (ids,),
         ).fetchall()

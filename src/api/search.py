@@ -21,8 +21,10 @@ from .videos import require_auth, user_id as user_id_dep
 router = APIRouter(tags=["search"])
 
 UI_DIR = Path(__file__).resolve().parents[2] / "ui"
+CORPUS_DIR = config.DATA / "corpus"
 _FRAME_RE = re.compile(r"^\d{6}\.jpg$")
 _USER_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_CORPUS_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}\.pdf$")
 
 
 def _uid(value: str | None) -> str:
@@ -208,6 +210,21 @@ def video(video_id: str, u: str | None = None,
                              headers={"Content-Range": f"bytes {start}-{end}/{size}",
                                       "Accept-Ranges": "bytes",
                                       "Content-Length": str(length)})
+
+
+@router.get("/corpus/{name}")
+def corpus_pdf(name: str):
+    """Serves locally-authored paper/deck PDFs (e.g. our own architecture deck,
+    which has no public URL) so /admin/documents can register them the same
+    way it registers a real https:// paper — one fetch path, no file:// scheme
+    trust boundary in the ingestion pipeline."""
+    if not _CORPUS_NAME_RE.match(name):
+        raise HTTPException(404, "Not found.")
+    fp = CORPUS_DIR / name
+    if not fp.exists() or not fp.is_file():
+        raise HTTPException(404, "Not found.")
+    return FileResponse(fp, media_type="application/pdf",
+                        headers={"Cache-Control": "public, max-age=86400"})
 
 
 # ── UI ────────────────────────────────────────────────────────────────────────
