@@ -1,0 +1,10 @@
+{"query": "asdkfj qwoeiru xzcvbn 12345 blorp", "note": "gibberish token soup — the exact string GPT's live probe used to surface the calibration gap"}
+{"query": "zzxx flerm dorbat nnn 000 vvv qqq", "note": "gibberish token soup, second sample"}
+{"query": "what's the best recipe for sourdough bread", "note": "well-formed, on-topic-shaped, unrelated to RAG/retrieval/queueing"}
+{"query": "how do I file my taxes as a freelancer", "note": "well-formed, unrelated"}
+{"query": "what were the causes of the fall of the roman empire", "note": "well-formed, unrelated"}
+{"query": "how does photosynthesis work in plants", "note": "well-formed, unrelated"}
+{"query": "what is the offside rule in soccer", "note": "well-formed, unrelated"}
+{"query": "what's the weather like in Tokyo today", "note": "well-formed, unrelated"}
+{"query": "how do I change a flat tire on my car", "note": "well-formed, unrelated"}
+{"query": "what is the capital of Mongolia", "note": "well-formed, unrelated"}

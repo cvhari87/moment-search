@@ -316,10 +316,20 @@ TOP_K = _int("TOP_K", 6)                 # frames fed to the multimodal LLM (3-8
 KNN_K = _int("KNN_K", 24)                # candidates fetched before trimming to TOP_K
 # Gate 1: abstain WITHOUT calling the LLM if BOTH branches' best raw score is
 # below their threshold. Fusion scores are RRF (tiny), so the gate uses each
-# branch's own raw cosine. CLIP text->image cosines run low (~0.2-0.35); bge
-# text-text cosines run higher (~0.5-0.7 for real matches). 0 disables.
-CONFIDENCE_THRESHOLD = _float("CONFIDENCE_THRESHOLD", 0.2)              # visual (CLIP)
-TEXT_CONFIDENCE_THRESHOLD = _float("TEXT_CONFIDENCE_THRESHOLD", 0.35)  # transcript (bge)
+# branch's own raw cosine. Calibrated 2026-07-29 via benchmark/
+# calibrate_thresholds.py against benchmark/queries.jsonl (labeled positives)
+# and benchmark/negative_queries.jsonl (irrelevant/nonsense queries), on this
+# corpus: CLIP text->image noise floor runs ~0.23-0.33 REGARDLESS of query
+# relevance (0.2 never separated anything — the gate's AND condition on
+# visual was structurally unreachable, which is why nonsense queries were
+# passing through); bge text-text noise floor runs ~0.53-0.70 for irrelevant
+# queries vs. ~0.74-0.90 for real matches, which DOES separate cleanly. Both
+# values matter together — see gate_citations() in src/rag/search.py: reject
+# requires BOTH branches below threshold, so raising just one is not enough
+# (see benchmark/calibrate_thresholds.py's AND-aware check). Re-run that
+# script after growing either query set; these are not meant to be static.
+CONFIDENCE_THRESHOLD = _float("CONFIDENCE_THRESHOLD", 0.28)              # visual (CLIP)
+TEXT_CONFIDENCE_THRESHOLD = _float("TEXT_CONFIDENCE_THRESHOLD", 0.72)  # transcript (bge)
 
 # --- Multimodal LLM (answer synthesis only — retrieval works without it) -----------
 # LLM_PROVIDER: openai | nvidia | anthropic ("openai" also covers any

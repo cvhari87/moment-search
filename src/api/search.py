@@ -155,6 +155,21 @@ def ask(req: AskRequest, x_user_id: str | None = Header(default=None)):
                           video_ids=video_ids)
 
 
+@router.get("/admin/debug/retrieve", dependencies=[Depends(require_auth)])
+def debug_retrieve(q: str, x_user_id: str | None = Header(default=None)):
+    """Admin-only introspection into Gate 1's raw inputs. Neither /api/ask nor
+    /ask_stream ever returns best_visual/best_text (the public contract has
+    no business exposing threshold internals), but benchmark/calibrate_
+    thresholds.py needs exactly these two numbers against the LIVE index —
+    the same embeddings, the same corpus — to calibrate CONFIDENCE_THRESHOLD
+    / TEXT_CONFIDENCE_THRESHOLD against real separation between labeled
+    positive and negative queries, not a guess."""
+    uid = _uid(x_user_id)
+    r = rag_search.retrieve(q.strip(), uid)
+    return {"best_visual": r["best_visual"], "best_text": r["best_text"],
+            "n_citations": len(r["citations"])}
+
+
 def _sse(data: dict) -> str:
     return f"data: {json.dumps(data)}\n\n"
 
@@ -187,13 +202,25 @@ def ask_stream(q: str, x_user_id: str | None = Header(default=None)):
         gated = rag_search.gate_citations(r["citations"], r["best_visual"], r["best_text"])
         # Citations with no retrieved text (e.g. a frame-only visual match)
         # would zero the assignment's all-or-nothing "grounded" check for
-        # every OTHER citation in the same answer — omit them here. POST
+        # every OTHER citation in the same answer — drop them here. POST
         # /api/ask still returns them; the UI there renders frame-only
         # moments fine.
+        #
+        # Renumber after filtering, and — critically — pass THIS exact list
+        # into answer_from_citations() below, not r["citations"]. The LLM's
+        # [n] references are positional over whatever list builds its
+        # `moments` (src/llm.py: enumerate(moments, 1)), so if the answer
+        # were generated from the unfiltered list while the client only saw
+        # the filtered one, "[1]" in the answer could point at a citation
+        # the client never received — the two would disagree about what's
+        # even on the numbered list. Reusing the identical list for both
+        # steps is what keeps them impossible to disagree.
         grounded_citations = [c for c in gated if c.get("text")]
+        for i, c in enumerate(grounded_citations, 1):
+            c["n"] = i
         yield _sse({"citations": grounded_citations})
         result = rag_search.answer_from_citations(
-            question, uid, r["citations"], r["best_visual"], r["best_text"])
+            question, uid, grounded_citations, r["best_visual"], r["best_text"])
         yield _sse({k: v for k, v in result.items() if k != "citations"})
 
     return StreamingResponse(events(), media_type="text/event-stream",
