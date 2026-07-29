@@ -5,7 +5,8 @@ Upload flow (gigabytes never touch this process):
                                    the key: uploads/{user}/{id}.{ext})
   2. browser PUTs the file straight to object storage
   3. POST /api/videos           -> HEAD-verify the object, insert a pending
-                                   Postgres row, schedule a Prefect run, 202
+                                   Postgres row, 202 — src/dispatcher.py
+                                   admits it and schedules the Prefect run
 
 YouTube flow: POST /api/videos {"url": ...} — the worker downloads it.
 
@@ -22,7 +23,7 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from pydantic import BaseModel
 
-from .. import config, db, jobs, storage
+from .. import db, storage
 from ..samples import is_sample
 from ..config import (
     ADMIN_TOKEN,
@@ -141,12 +142,14 @@ def register(req: RegisterRequest, uid: str = Depends(user_id)):
     else:
         raise HTTPException(400, "Provide either url (YouTube) or video_id+key (upload).")
 
-    # Fair dispatch (WFQ): leave it `pending` — the dispatcher admits it in fair
-    # order (src/dispatcher.py). FIFO mode: enqueue to Prefect immediately.
-    if config.ENABLE_FAIR_DISPATCH:
-        return {"video_id": row["id"], "status": "pending"}
-    flow_run_id = jobs.enqueue_video(row["id"], uid)
-    return {"video_id": row["id"], "status": row["status"], "flow_run_id": flow_run_id}
+    # Always leave it `pending` for the dispatcher (src/dispatcher.py) to admit
+    # — never enqueue directly here. A direct enqueue plus this row still
+    # reading `pending` used to race the dispatcher's own claim (both would
+    # admit it, producing two Prefect runs for one video): enqueue_video()
+    # doesn't itself update status, and Prefect scheduling latency can easily
+    # exceed one dispatcher tick. ENABLE_FAIR_DISPATCH now only selects WFQ
+    # vs FIFO ordering inside db.wfq_claim, not which path enqueues.
+    return {"video_id": row["id"], "status": "pending"}
 
 
 # ── Status / lifecycle ─────────────────────────────────────────────────────────
@@ -182,10 +185,7 @@ def retry(video_id: str, uid: str = Depends(user_id)):
     if row is None or row["user_id"] != uid:
         raise HTTPException(404, "Video not found.")
     db.set_status(video_id, "pending", error=None)
-    if config.ENABLE_FAIR_DISPATCH:
-        return {"video_id": video_id, "status": "pending"}  # dispatcher re-admits it fairly
-    flow_run_id = jobs.enqueue_video(video_id, uid)
-    return {"video_id": video_id, "status": "pending", "flow_run_id": flow_run_id}
+    return {"video_id": video_id, "status": "pending"}  # dispatcher re-admits it (see register())
 
 
 @router.delete("/{video_id}", dependencies=[Depends(require_auth)])

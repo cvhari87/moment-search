@@ -221,31 +221,49 @@ def count_inflight() -> int:
     return row["n"] if row else 0
 
 
-def wfq_claim(limit: int) -> list[dict]:
-    """Atomically claim up to `limit` pending videos in FAIR (round-robin across
-    users) order, flipping them pending -> queued. Returns the claimed rows.
+def wfq_claim(limit: int, *, fair: bool = True) -> list[dict]:
+    """Atomically claim up to `limit` pending sources (any kind), flipping
+    them pending -> queued. Returns the claimed rows.
 
-    Fairness: rank each user's pending videos by age (row_number partitioned by
-    user_id), then order by that rank first — so we take everyone's oldest, then
-    everyone's 2nd, ... A user who dumped 50 videos only gets one slot per round,
-    exactly like the others. The UPDATE ... WHERE status='pending' RETURNING is
-    the atomic claim: if two dispatchers race, each row is handed out once.
+    Every source is admitted through here — there is no direct-enqueue path
+    anywhere else (see src/api/videos.py, src/api/documents.py) — because a
+    direct enqueue plus a background claimer racing the same 'pending' row
+    used to schedule two Prefect runs for one source. ENABLE_FAIR_DISPATCH
+    only picks the ORDERING below, never whether this is the admission path.
+
+    fair=True  (ENABLE_FAIR_DISPATCH=true, default): round-robin across
+      users — rank each user's pending sources by age (row_number
+      partitioned by user_id), then order by that rank first, so we take
+      everyone's oldest, then everyone's 2nd, ... A user who dumped 50
+      videos only gets one slot per round, exactly like the others.
+    fair=False (ENABLE_FAIR_DISPATCH=false): plain FIFO by creation time
+      across all users — "useful for A/B teaching the difference" per the
+      module docstring in src/dispatcher.py.
+
+    The UPDATE ... WHERE status='pending' RETURNING is the atomic claim:
+    if two dispatchers race, each row is handed out once.
     """
     if limit <= 0:
         return []
+    order_sql = (
+        """
+        SELECT id FROM (
+            SELECT id, row_number() OVER (
+                PARTITION BY user_id ORDER BY created_at, id) AS rn
+            FROM ms_videos WHERE status = 'pending'
+        ) t
+        ORDER BY rn, id
+        LIMIT %s
+        """
+        if fair else
+        """
+        SELECT id FROM ms_videos WHERE status = 'pending'
+        ORDER BY created_at, id
+        LIMIT %s
+        """
+    )
     with pool().connection() as conn:
-        picked = conn.execute(
-            """
-            SELECT id FROM (
-                SELECT id, row_number() OVER (
-                    PARTITION BY user_id ORDER BY created_at, id) AS rn
-                FROM ms_videos WHERE status = 'pending'
-            ) t
-            ORDER BY rn, id
-            LIMIT %s
-            """,
-            (limit,),
-        ).fetchall()
+        picked = conn.execute(order_sql, (limit,)).fetchall()
         ids = [r["id"] for r in picked]
         if not ids:
             return []
