@@ -208,9 +208,14 @@ def retry(video_id: str, uid: str = Depends(user_id)):
 
 @router.delete("/{video_id}", dependencies=[Depends(require_auth)])
 def delete(video_id: str, uid: str = Depends(user_id)):
-    """Deleting a video purges everything: vectors, thumbnails, the raw upload,
-    and the manifest row — batch calls where the provider supports them.
-    Sample videos are protected (unselect them from a query instead)."""
+    """Deleting a source purges everything: vectors, thumbnails/checkpoints,
+    the raw upload, and the manifest row — batch calls where the provider
+    supports them. Sample videos are protected (unselect them from a query
+    instead). Kind-blind on purpose (see module docstring): a document row's
+    storage_key (if it was an upload, not a URL registration) is cleaned up
+    by the SAME storage_key branch a video's upload is, and its parse/chunk
+    checkpoints (docs/{user}/{id}/*.json) are the document-specific artifact
+    a video row never has."""
     if is_sample(video_id):
         raise HTTPException(403, "Sample videos can't be deleted — unselect it "
                                  "from your query instead.")
@@ -221,5 +226,8 @@ def delete(video_id: str, uid: str = Depends(user_id)):
     storage.delete_prefix(storage.frame_prefix(uid, video_id))
     if row.get("storage_key"):
         storage.delete_key(row["storage_key"])
+    if row.get("kind", "video") != "video":
+        from ..ingest.document import doc_prefix
+        storage.delete_prefix(doc_prefix(uid, video_id))
     db.delete_video(video_id)
     return {"ok": True, "video_id": video_id}

@@ -219,7 +219,15 @@ function authHeaders(){ const t=getToken(); return t?{"Authorization":"Bearer "+
 const tokenEl=$("#adminToken");
 if(tokenEl){
   tokenEl.value=getToken();
-  tokenEl.addEventListener("input",()=>sessionStorage.setItem("ms_admin_token",tokenEl.value.trim()));
+  let _tokenDebounce=null;
+  tokenEl.addEventListener("input",()=>{
+    sessionStorage.setItem("ms_admin_token",tokenEl.value.trim());
+    // Both lists 401 (videos) / show the "enter a token" placeholder
+    // (documents) until a valid token is entered — refresh both once typing
+    // settles instead of making the user reload or click something else.
+    clearTimeout(_tokenDebounce);
+    _tokenDebounce=setTimeout(()=>{ loadVideos(); if($("#docs")) loadDocs(); }, 400);
+  });
 }
 
 /* ---------- config + library ---------- */
@@ -250,7 +258,11 @@ async function loadVideos(){
   // sync selection: new indexed videos default to selected; drop vanished ones
   const indexedIds=new Set(shown.filter(v=>v.status==="indexed").map(v=>v.id));
   indexedIds.forEach(id=>{ if(!KNOWN.has(id)){ KNOWN.add(id); SELECTED.add(id); }});
-  [...KNOWN].forEach(id=>{ if(!indexedIds.has(id)){ KNOWN.delete(id); SELECTED.delete(id); }});
+  // KNOWN/SELECTED are shared with loadDocs() (documents search alongside
+  // videos) — only reconcile the video-shaped ids here (doc_ ids are doc_
+  // prefixed, never yt_/up_), or every video poll would drop every document
+  // from the selection the instant this ran.
+  [...KNOWN].forEach(id=>{ if(!id.startsWith("doc_") && !indexedIds.has(id)){ KNOWN.delete(id); SELECTED.delete(id); }});
 
   const srcLabel=v=>v.is_sample?"sample":(v.source==="youtube"?"YouTube":"upload");
   const pct=v=>v.progress?` ${Math.round(v.progress*100)}%`:"";
@@ -402,22 +414,50 @@ async function loadDocs(){
   if(!r.ok){ box.innerHTML='<span class="text-muted text-sm">Enter the admin token above to see documents.</span>'; return []; }
   const {sources}=await r.json();
   const docs=sources.filter(s=>s.kind!=="video");
+
+  // Same "indexed docs are selectable, default to selected" sync loadVideos()
+  // does — SELECTED feeds /api/ask's video_ids directly (see $("#go") below),
+  // so without this an uploaded document would index successfully but never
+  // actually be searched. Scoped to doc_ ids (see the matching comment in
+  // loadVideos()) so this doesn't fight over video ids in the shared sets.
+  const indexedIds=new Set(docs.filter(d=>d.status==="indexed").map(d=>d.id));
+  indexedIds.forEach(id=>{ if(!KNOWN.has(id)){ KNOWN.add(id); SELECTED.add(id); }});
+  [...KNOWN].forEach(id=>{ if(id.startsWith("doc_") && !indexedIds.has(id)){ KNOWN.delete(id); SELECTED.delete(id); }});
+
   box.innerHTML = docs.length ? docs.map(d=>{
     const b=docBadge(d);
+    const indexed=d.status==="indexed";
+    const sel=SELECTED.has(d.id);
+    const toggle=SELECTABLE()&&indexed;
+    const lead=toggle
+      ? `<span class="mr-1.5">${sel?"☑":"☐"}</span>`
+      : `<span class="mr-1.5 ${b.c}" title="${esc(b.label)}">${b.icon}</span>`;
+    const cls="chip"+(toggle&&!sel?" opacity-40":"");
+    const attrs=toggle?`data-docsel="${esc(d.id)}" title="Click to include or exclude from your search"`:'style="cursor:default"';
     const retry=d.status==="failed"
       ? `<button class="ml-2 text-muted hover:text-coral2" data-docretry="${esc(d.id)}" title="Retry ingest">↻</button>` : "";
     const trash=`<button class="ml-2 text-muted hover:text-coral2" data-docdel="${esc(d.id)}" data-title="${esc(d.title||d.id)}" title="Delete permanently">🗑</button>`;
-    return `<span class="chip" style="cursor:default">${d.kind==="deck"?"📑":"📄"} ${esc(d.title||d.id)} <span class="${b.c}">· ${esc(b.label)}</span>${retry}${trash}</span>`;
+    return `<span class="${cls}" ${attrs}>${lead}${d.kind==="deck"?"📑":"📄"} ${esc(d.title||d.id)} <span class="${b.c}">· ${esc(b.label)}</span>${retry}${trash}</span>`;
   }).join("") : '<span class="text-muted text-sm">No documents yet — upload one above.</span>';
-  box.querySelectorAll("[data-docretry]").forEach(btn=>btn.onclick=async()=>{
-    await fetch("/api/videos/"+encodeURIComponent(btn.dataset.docretry)+"/retry",{method:"POST",headers:authHeaders()});
+
+  box.querySelectorAll("[data-docsel]").forEach(el=>el.onclick=(e)=>{
+    if(e.target.closest("[data-docdel],[data-docretry]"))return;
+    const id=el.dataset.docsel;
+    SELECTED.has(id)?SELECTED.delete(id):SELECTED.add(id);
+    loadDocs();
+  });
+  box.querySelectorAll("[data-docretry]").forEach(btn=>btn.onclick=async(e)=>{
+    e.stopPropagation();
+    const r=await fetch("/api/videos/"+encodeURIComponent(btn.dataset.docretry)+"/retry",{method:"POST",headers:authHeaders()});
+    if(!r.ok){ const d=await r.json().catch(()=>({})); alert(d.detail||"Retry failed."); return; }
     loadDocs(); startDocRefresher();
   });
-  box.querySelectorAll("[data-docdel]").forEach(btn=>btn.onclick=async()=>{
-    if(!confirm(`Delete “${btn.dataset.title}”?\n\nThis permanently removes its search vectors. This can’t be undone.`)) return;
+  box.querySelectorAll("[data-docdel]").forEach(btn=>btn.onclick=async(e)=>{
+    e.stopPropagation();
+    if(!confirm(`Delete “${btn.dataset.title}”?\n\nThis permanently removes its file and search vectors. This can’t be undone.`)) return;
     const r=await fetch("/api/videos/"+encodeURIComponent(btn.dataset.docdel),{method:"DELETE",headers:authHeaders()});
-    if(!r.ok){ const e=await r.json().catch(()=>({})); alert(e.detail||"Delete failed."); return; }
-    loadDocs();
+    if(!r.ok){ const e2=await r.json().catch(()=>({})); alert(e2.detail||"Delete failed."); return; }
+    KNOWN.delete(btn.dataset.docdel); SELECTED.delete(btn.dataset.docdel); loadDocs();
   });
   return docs;
 }

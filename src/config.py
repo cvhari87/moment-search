@@ -229,6 +229,14 @@ DOCUMENT_FETCH_ALLOWED_INTERNAL_HOSTS = [
     h.strip().lower() for h in os.getenv("DOCUMENT_FETCH_ALLOWED_INTERNAL_HOSTS", "api:8000").split(",")
     if h.strip()
 ]
+# Deck-only: a slide whose extracted text is shorter than this is treated as
+# text-poor (title slide, diagram, photo) and rendered + captioned by the
+# vision LLM instead of embedding near-nothing. Papers never take this
+# branch — a sparse paper page (a figure, a section break) is normal.
+DECK_SLIDE_MIN_CHARS = _int("DECK_SLIDE_MIN_CHARS", 40)
+# Render resolution for the text-poor-slide screenshot handed to the vision
+# model — high enough to keep on-slide text legible, not print quality.
+DECK_SLIDE_RENDER_DPI = _int("DECK_SLIDE_RENDER_DPI", 150)
 
 # --- Fusion (multimodal retrieval) ---------------------------------------------
 # RRF: rank-based fusion across branches (score-agnostic). rrf = 1/(K + rank).

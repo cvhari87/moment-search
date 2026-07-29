@@ -38,8 +38,10 @@ import urllib.parse
 
 from prefect import flow, task
 
-from .. import db, storage
+from .. import db, llm, storage
 from ..config import (
+    DECK_SLIDE_MIN_CHARS,
+    DECK_SLIDE_RENDER_DPI,
     DOCUMENT_CHUNK_CHARS,
     DOCUMENT_FETCH_ALLOWED_INTERNAL_HOSTS,
     DOCUMENT_FETCH_MAX_MB,
@@ -51,6 +53,15 @@ from ..rag.embeddings import embed_docs
 
 _MAX_BYTES = DOCUMENT_FETCH_MAX_MB * 1024 * 1024
 
+# Paper and deck are one parameterized code path (parse -> chunk -> embed),
+# not two modules. This is the one thing that actually differs: the name of
+# the locator field a chunk's payload carries downstream — a page number for
+# a paper, a slide number for a deck. Both are still, internally, just "the
+# PDF page index" (see _parse_pdf/_chunk_page) — this only renames the field
+# at the Qdrant-payload boundary, where eval.py and the UI expect `slide`
+# for decks (not `page`).
+KIND_SPEC = {"paper": "page", "deck": "slide"}
+
 
 def _parsed_key(user_id: str, doc_id: str) -> str:
     return f"docs/{user_id}/{doc_id}/parsed.json"
@@ -58,6 +69,13 @@ def _parsed_key(user_id: str, doc_id: str) -> str:
 
 def _chunks_key(user_id: str, doc_id: str) -> str:
     return f"docs/{user_id}/{doc_id}/chunks.json"
+
+
+def doc_prefix(user_id: str, doc_id: str) -> str:
+    """Prefix covering both this document's checkpoints — used by the delete
+    endpoint (src/api/videos.py) to purge them in one batch call, the same
+    way it already purges a video's frame_prefix()."""
+    return f"docs/{user_id}/{doc_id}/"
 
 
 def _is_blocked_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
@@ -168,15 +186,52 @@ def _fetch_bytes(uri: str) -> bytes:
     return data
 
 
-def _parse_pdf(data: bytes) -> list[dict]:
-    """PDF bytes -> [{page, text}], 1-indexed to match real, human page numbers
-    (what a citation deep-links to). Imported lazily — nothing at module scope
-    pulls in pymupdf, keeping it out of the API process entirely."""
+def _resolve_caption_llm(user_id: str) -> llm.LLMConfig | None:
+    """Same tenant-first, server-fallback resolution search.py uses to pick a
+    model for answering — reused here so a deck's vision captions render with
+    whichever model the user would actually get at query time. Imported
+    lazily (like fitz below) to keep document.py's module-level import graph
+    light; nothing here runs in the API process."""
+    from ..rag.search import resolve_llm
+
+    cfg, _source = resolve_llm(user_id)
+    return cfg
+
+
+def _parse_pdf(data: bytes, kind: str, user_id: str) -> list[dict]:
+    """PDF bytes -> [{page, text}], 1-indexed to match real, human page
+    numbers (what a citation deep-links to; for a deck this is the slide
+    number). Imported lazily — nothing at module scope pulls in pymupdf,
+    keeping it out of the API process entirely.
+
+    Deck-only: a slide whose extracted text is below DECK_SLIDE_MIN_CHARS
+    (a title slide, a diagram-only slide) is rendered to an image and
+    captioned by the vision LLM instead of embedding near-nothing. Papers
+    never take this branch — a sparse paper page (a figure, a section
+    break) is normal PDF reality, not a gap to fill. If no model is
+    configured, the slide's (possibly sparse) extracted text is kept as-is
+    rather than failing the whole document."""
     import fitz  # pymupdf
+
+    caption_cfg = _resolve_caption_llm(user_id) if kind == "deck" else None
 
     doc = fitz.open(stream=data, filetype="pdf")
     try:
-        return [{"page": i + 1, "text": doc[i].get_text()} for i in range(len(doc))]
+        pages = []
+        for i in range(len(doc)):
+            page = doc[i]
+            text = page.get_text()
+            if kind == "deck" and len(text.strip()) < DECK_SLIDE_MIN_CHARS and caption_cfg is not None:
+                try:
+                    image = page.get_pixmap(dpi=DECK_SLIDE_RENDER_DPI).tobytes()
+                    caption = llm.caption_image(image, caption_cfg)
+                    if caption.strip():
+                        text = caption
+                except Exception as exc:
+                    print(f"[parse] slide {i + 1}: caption failed "
+                          f"({type(exc).__name__}: {exc}) — keeping extracted text")
+            pages.append({"page": i + 1, "text": text})
+        return pages
     finally:
         doc.close()
 
@@ -268,14 +323,22 @@ def _load_checkpoint(key: str, validate) -> list[dict] | None:
 
 
 @task(name="parse-document", retries=2, retry_delay_seconds=[30, 120])
-def t_parse(doc_id: str, user_id: str, uri: str) -> list[dict]:
+def t_parse(doc_id: str, user_id: str, uri: str | None, kind: str,
+           storage_key: str | None = None) -> list[dict]:
+    """Get the raw PDF bytes one of two ways: `storage_key` (an upload
+    already sitting in OUR storage — read directly, no fetch, no expiry,
+    trusted the same way a checkpoint read is) takes priority over `uri`
+    (an external https:// document — SSRF-hardened HTTP fetch, since we
+    don't already have those bytes ourselves). Exactly one is set per row
+    (src/api/documents.py's _register)."""
     db.set_status(doc_id, "parsing")
     key = _parsed_key(user_id, doc_id)
     cached = _load_checkpoint(key, _valid_parsed_pages)
     if cached is not None:
         print(f"[parse] {doc_id}: parsed.json already committed — resuming from checkpoint")
         return cached
-    pages = _parse_pdf(_fetch_bytes(uri))
+    data = storage.get_bytes(storage_key) if storage_key else _fetch_bytes(uri)
+    pages = _parse_pdf(data, kind, user_id)
     if not any(p["text"].strip() for p in pages):
         raise RuntimeError("No extractable text in document.")
     storage.put_bytes(key, json.dumps(pages).encode(), "application/json")
@@ -315,9 +378,10 @@ def t_embed(doc_id: str, user_id: str, chunks: list[dict], kind: str, uri: str) 
     if len(vecs) != len(chunks):
         raise RuntimeError(f"embed_docs returned {len(vecs)} vectors for {len(chunks)} chunks "
                            f"— refusing to upsert a mismatched batch.")
+    locator_key = KIND_SPEC.get(kind, "page")
     vector_store.upsert_chunks(user_id, doc_id, vecs, payloads=[
         {"user_id": user_id, "video_id": doc_id, "source_id": doc_id, "kind": kind,
-         "page": c["page"], "uri": uri, "text": c["text"], "modality": "text",
+         locator_key: c["page"], "uri": uri, "text": c["text"], "modality": "text",
          "embed_version": TEXT_EMBED_VERSION}
         for c in chunks
     ])
@@ -332,10 +396,10 @@ def ingest_document(doc_id: str, user_id: str, kind: str) -> dict:
         row = db.get_video(doc_id)
         if row is None:
             raise ValueError(f"no manifest row for {doc_id}")
-        uri = row["uri"]
-        if not uri:
-            raise ValueError(f"{doc_id} has no uri")
-        pages = t_parse(doc_id, user_id, uri)
+        uri, storage_key = row["uri"], row.get("storage_key")
+        if not uri and not storage_key:
+            raise ValueError(f"{doc_id} has no uri or storage_key")
+        pages = t_parse(doc_id, user_id, uri, kind, storage_key)
         chunks = t_chunk(doc_id, user_id, pages)
         n = t_embed(doc_id, user_id, chunks, kind, uri)
         print(f"[ingest] {doc_id} indexed: {n} chunks (attempt {attempt})")

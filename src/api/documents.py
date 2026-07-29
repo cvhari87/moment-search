@@ -10,13 +10,16 @@ Both source kinds land in the SAME `ms_videos` table (see src/db.py) — a
 need no rewrite to fairly admit documents alongside videos.
 
 The upload path does NOT give ingestion a second, different fetch
-mechanism to trust — it writes the bytes to the same place our own corpus
-deck already lives (data/corpus/, served by GET /corpus/{name} in
-src/api/search.py) and then calls the SAME uri-based registration path
-below. One fetch path (src/ingest/document.py's SSRF-hardened
-_fetch_bytes), reused, not duplicated — the same reasoning as why the
-deck itself is self-hosted there rather than given its own file:// special
-case.
+mechanism to trust — an uploaded PDF is written straight to this app's own
+object storage under a private, content-addressed key (documents/{user}/
+{sha256}.pdf, never under the public corpus/ prefix that /corpus/{name}
+serves unauthenticated) and the manifest row's `storage_key` points at it.
+src/ingest/document.py reads it back with storage.get_bytes() — no HTTP
+hop, no SSRF surface, no presigned URL that could expire before a worker
+gets to it or a later retry runs. The SSRF-hardened HTTP fetch
+(_fetch_bytes) is reserved for the OTHER registration path — a real
+external https:// paper/deck URL, which is the one case where we don't
+already have the bytes ourselves.
 """
 from __future__ import annotations
 
@@ -27,6 +30,7 @@ import urllib.parse
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
+from starlette.concurrency import run_in_threadpool
 
 from .. import config, db, storage
 from .videos import _PUBLIC_FIELDS, require_auth, user_id
@@ -36,6 +40,7 @@ router = APIRouter(prefix="/admin", tags=["documents"])
 _URI_RE = re.compile(r"^https?://\S+$")
 _KINDS = ("paper", "deck")
 _UPLOAD_MAX_BYTES = config.DOCUMENT_FETCH_MAX_MB * 1024 * 1024
+_UPLOAD_KEY_PREFIX = "documents/"  # private — distinct from the public corpus/ prefix
 
 
 def _obviously_unsafe_host(uri: str) -> bool:
@@ -57,36 +62,50 @@ def _obviously_unsafe_host(uri: str) -> bool:
             or ip.is_multicast or ip.is_unspecified or ip.is_reserved)
 
 
-def _doc_id(user_id: str, uri: str) -> str:
-    """Deterministic from (user_id, uri) — re-registering the same URI as the
-    SAME user updates that one row instead of piling up duplicates. Scoped by
-    user_id (unlike yt_<video_id>, which the video path leaves unscoped — a
-    pre-existing gap there, not one to newly copy here): hashing the URI alone
-    would let two different users collide on one manifest row, silently
+def _doc_id(user_id: str, identity: str) -> str:
+    """Deterministic from (user_id, identity) — re-registering the SAME
+    identity as the SAME user updates that one row instead of piling up
+    duplicates. `identity` is the external URI for URL-registered documents,
+    or a content-hash token ("upload:<sha256>") for uploads — NOT the
+    presigned/uploaded storage key, which would defeat this: two identical
+    uploads must resolve to the same doc_id so a re-upload updates the
+    existing row instead of registering a duplicate. Scoped by user_id
+    (unlike yt_<video_id>, which the video path leaves unscoped — a
+    pre-existing gap there, not one to newly copy here): hashing identity
+    alone would let two different users collide on one manifest row, silently
     handing one tenant's document to another (upsert_pending's ON CONFLICT
     never re-checks or updates user_id)."""
-    return "doc_" + hashlib.sha256(f"{user_id}:{uri}".encode()).hexdigest()[:12]
+    return "doc_" + hashlib.sha256(f"{user_id}:{identity}".encode()).hexdigest()[:12]
 
 
-def _register(uid: str, uri: str, kind: str, title: str | None) -> dict:
+def _register(uid: str, kind: str, title: str | None, *,
+              uri: str | None = None, storage_key: str | None = None,
+              source_hash: str | None = None) -> dict:
     """Shared by both registration paths (URL and upload) — validate,
     insert-pending, and return. Unlike the video path, neither ever falls
     back to a direct synchronous enqueue: ASSIGNMENT_AGENTS.md
     non-negotiable #1 is explicit that ingestion work happens on a worker,
     never in the request path. Only the dispatcher's background thread
-    (src/dispatcher.py) ever calls jobs.enqueue_document."""
+    (src/dispatcher.py) ever calls jobs.enqueue_document.
+
+    Exactly one of uri/storage_key identifies where the bytes live: `uri` for
+    an external https:// document (src/ingest/document.py fetches it, SSRF-
+    hardened, at ingest time), `storage_key` for an upload already sitting in
+    OUR storage (read directly via storage.get_bytes() — no fetch, no expiry,
+    no public exposure)."""
     if kind not in _KINDS:
         raise HTTPException(400, f"kind must be one of {_KINDS}.")
-    if not _URI_RE.match(uri):
-        raise HTTPException(400, "uri must be http(s) — fetchability is checked "
-                                 "during ingestion, not at registration time.")
-    if _obviously_unsafe_host(uri):
-        raise HTTPException(400, "uri resolves to a non-public address range "
-                                 "(loopback / link-local / private / metadata).")
-    doc_id = _doc_id(uid, uri)
+    if uri is not None:
+        if not _URI_RE.match(uri):
+            raise HTTPException(400, "uri must be http(s) — fetchability is checked "
+                                     "during ingestion, not at registration time.")
+        if _obviously_unsafe_host(uri):
+            raise HTTPException(400, "uri resolves to a non-public address range "
+                                     "(loopback / link-local / private / metadata).")
+    doc_id = _doc_id(uid, source_hash or uri)
     row = db.upsert_pending({
         "id": doc_id, "user_id": uid, "source": "document",
-        "url": None, "storage_key": None, "source_hash": uri,
+        "url": None, "storage_key": storage_key, "source_hash": source_hash or uri,
         "title": title, "kind": kind, "uri": uri,
     })
     return {"id": row["id"], "status": row["status"], "kind": row["kind"]}
@@ -100,7 +119,8 @@ class RegisterDocument(BaseModel):
 
 @router.post("/documents", status_code=202, dependencies=[Depends(require_auth)])
 def register_document(req: RegisterDocument, uid: str = Depends(user_id)):
-    return _register(uid, req.uri.strip(), req.kind, req.title)
+    uri = req.uri.strip()
+    return _register(uid, req.kind, req.title, uri=uri, source_hash=uri)
 
 
 @router.post("/documents/upload", status_code=202, dependencies=[Depends(require_auth)])
@@ -110,7 +130,16 @@ async def upload_document(file: UploadFile = File(...), kind: str = Form(...),
     DOCUMENT_FETCH_MAX_MB) is cheap enough to pass through the API process
     itself; presigning exists for videos because those are large enough
     that routing gigabytes through this process would be wasteful, not
-    because a bypass is required in principle."""
+    because a bypass is required in principle.
+
+    The bytes land under a PRIVATE, content-addressed key
+    (documents/{user}/{sha256}.pdf) — never the public corpus/ prefix, which
+    /corpus/{name} serves to anyone with no auth (that route exists only for
+    this app's own self-hosted deck, a deliberately public fixture). Ingestion
+    reads the key straight from storage (storage_key on the row), so there is
+    no presigned URL to expire before a queued job or a later retry runs, and
+    re-uploading identical bytes resolves to the SAME doc_id (content-hash
+    identity) instead of registering a duplicate every time."""
     if kind not in _KINDS:
         raise HTTPException(400, f"kind must be one of {_KINDS}.")
     data = await file.read(_UPLOAD_MAX_BYTES + 1)
@@ -120,20 +149,14 @@ async def upload_document(file: UploadFile = File(...), kind: str = Form(...),
         raise HTTPException(415, "Only PDF uploads are accepted.")
 
     digest = hashlib.sha256(data).hexdigest()[:16]
-    if storage.presign_capable():
-        key = f"documents/{uid}/{digest}.pdf"
-        storage.put_bytes(key, data, "application/pdf")
-        uri = storage.presign_get(key)
-    else:
-        # Reuses the exact local-serving mechanism the corpus deck already
-        # depends on (GET /corpus/{name} in src/api/search.py) rather than
-        # inventing a second local-file trust path — one fetch mechanism
-        # for the ingestion pipeline to reason about, not two.
-        filename = f"{uid}_{digest}.pdf"
-        storage.put_bytes(f"corpus/{filename}", data, "application/pdf")
-        uri = f"http://api:8000/corpus/{filename}"
+    key = f"{_UPLOAD_KEY_PREFIX}{uid}/{digest}.pdf"
+    # Off the event loop: boto3/GCS calls are blocking, and a 50MB body
+    # sitting in this coroutine would otherwise stall every other request
+    # this API process is handling concurrently.
+    await run_in_threadpool(storage.put_bytes, key, data, "application/pdf")
 
-    return _register(uid, uri, kind, title or file.filename)
+    return _register(uid, kind, title or file.filename,
+                     storage_key=key, source_hash=f"upload:{digest}")
 
 
 _SOURCE_FIELDS = _PUBLIC_FIELDS + ("kind", "uri", "chunk_count")
