@@ -120,6 +120,7 @@ def upsert_pending(video: dict[str, Any]) -> dict:
                 source_hash = COALESCE(EXCLUDED.source_hash, ms_videos.source_hash),
                 title = COALESCE(EXCLUDED.title, ms_videos.title),
                 uri = COALESCE(EXCLUDED.uri, ms_videos.uri),
+                kind = EXCLUDED.kind,
                 status = 'pending', error = NULL, progress = NULL, updated_at = now()
             RETURNING *
             """,

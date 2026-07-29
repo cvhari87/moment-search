@@ -30,6 +30,15 @@ from .rag import vector_store
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     db.init_schema()
+    # Regenerate the corpus deck PDF from its tracked Python source on every
+    # boot — the rendered PDF is never committed (ASSIGNMENT_AGENTS.md
+    # non-negotiable #7), so it must exist wherever this process runs: local
+    # dev, CI, or the Fly image. Deterministic + idempotent, cheap either way.
+    try:
+        from corpus.generate_deck import build_deck
+        build_deck(config.DATA / "corpus" / "one-index-for-every-source-deck.pdf")
+    except Exception as exc:
+        print(f"[startup] corpus deck generation failed ({exc!r}) — /corpus/* will 404")
     # Create the Qdrant collection up front (known CLIP dims resolve without
     # loading the model) so a question before the first ingest returns
     # "no moments" instead of a 500. Qdrant being down must not block boot.

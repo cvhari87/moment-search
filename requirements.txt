@@ -29,3 +29,9 @@ yt-dlp>=2026.7.4
 # Bring-your-own multimodal LLM (optional providers; install what you use)
 openai>=1.30
 # anthropic>=0.25   # uncomment for LLM_PROVIDER=anthropic
+
+# Corpus fixture generation (corpus/generate_deck.py) — pure Python, no
+# Chrome/LibreOffice dependency, so the deck regenerates identically in the
+# slim image, CI, or a fresh clone. The rendered PDF itself is never
+# committed (ASSIGNMENT_AGENTS.md non-negotiable #7).
+reportlab>=4.0

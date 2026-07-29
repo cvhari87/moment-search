@@ -17,7 +17,7 @@ import re
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from .. import config, db
+from .. import db
 from .videos import _PUBLIC_FIELDS, require_auth, user_id
 
 router = APIRouter(prefix="/admin", tags=["documents"])
@@ -57,12 +57,12 @@ def register_document(req: RegisterDocument, uid: str = Depends(user_id)):
         "url": None, "storage_key": None, "source_hash": uri,
         "title": req.title, "kind": req.kind, "uri": uri,
     })
-    if config.ENABLE_FAIR_DISPATCH:
-        return {"id": row["id"], "status": "pending", "kind": row["kind"]}
-    from .. import jobs
-    flow_run_id = jobs.enqueue_document(row["id"], uid, row["kind"])
-    return {"id": row["id"], "status": row["status"], "kind": row["kind"],
-            "flow_run_id": flow_run_id}
+    # Unlike the video path, this never falls back to a direct synchronous
+    # enqueue: ASSIGNMENT_AGENTS.md non-negotiable #1 is explicit that
+    # ingestion work happens on a worker, never in the request path. Always
+    # insert-pending-and-return; only the dispatcher's background thread
+    # (src/dispatcher.py) ever calls jobs.enqueue_document.
+    return {"id": row["id"], "status": row["status"], "kind": row["kind"]}
 
 
 _SOURCE_FIELDS = _PUBLIC_FIELDS + ("kind", "uri", "chunk_count")
