@@ -2,7 +2,7 @@
 # (DATABASE_URL), object storage, Qdrant Cloud, Prefect Cloud for the work
 # queue — so every container here is stateless and disposable.
 #   docker compose up --build
-#   API + UI:        http://localhost:8000
+#   API + UI:        http://localhost:8100
 #   Run/queue view:  https://app.prefect.cloud -> Runs
 # Vector store is Qdrant Cloud via QDRANT_URL in .env. To run a local Qdrant
 # instead, add a qdrant service here and blank QDRANT_URL.
@@ -21,7 +21,7 @@ services:
 
   # STARTUP GATE — indexes the four sample talks and exits. api + worker wait
   # for it to finish (service_completed_successfully), so the UI is NEVER
-  # reachable with a half-indexed corpus: when localhost:8000 answers, the
+  # reachable with a half-indexed corpus: when localhost:8100 answers, the
   # samples are ready. Idempotent + durable (Qdrant Cloud) — after the first
   # successful run this exits in seconds. First run takes a few minutes
   # (model download + 4 videos); watch its logs: docker compose logs -f seed
