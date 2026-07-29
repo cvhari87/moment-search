@@ -177,12 +177,20 @@ def ask_stream(q: str, x_user_id: str | None = Header(default=None)):
             yield _sse({"citations": []})
             return
         r = rag_search.retrieve(question, uid)
+        # Gate 1 FIRST: a nonsense query can still return top-K nearest
+        # neighbors (vector search always returns something), but if neither
+        # branch's best raw score clears the confidence threshold, those
+        # aren't citations — showing them here would contradict the abstain
+        # answer that's about to follow. Same gate answer_from_citations
+        # applies below, so the citations event and the eventual answer can
+        # never disagree about whether anything was actually found.
+        gated = rag_search.gate_citations(r["citations"], r["best_visual"], r["best_text"])
         # Citations with no retrieved text (e.g. a frame-only visual match)
         # would zero the assignment's all-or-nothing "grounded" check for
         # every OTHER citation in the same answer — omit them here. POST
         # /api/ask still returns them; the UI there renders frame-only
         # moments fine.
-        grounded_citations = [c for c in r["citations"] if c.get("text")]
+        grounded_citations = [c for c in gated if c.get("text")]
         yield _sse({"citations": grounded_citations})
         result = rag_search.answer_from_citations(
             question, uid, r["citations"], r["best_visual"], r["best_text"])

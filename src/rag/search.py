@@ -16,7 +16,8 @@ from typing import Any
 
 from .. import config, db, llm, storage
 from ..config import (BRANCH_TOP_K, CONFIDENCE_THRESHOLD, CROSS_MODAL_BOOST,
-                      FUSION_WINDOW_S, RRF_K, TEXT_CONFIDENCE_THRESHOLD, TOP_K)
+                      DOCUMENT_FETCH_ALLOWED_INTERNAL_HOSTS, FUSION_WINDOW_S,
+                      RRF_K, TEXT_CONFIDENCE_THRESHOLD, TOP_K)
 from . import vector_store
 from .embeddings import embed_query, embed_text
 
@@ -149,15 +150,24 @@ def _doc_url(video: dict | None, user_id: str, doc_id: str) -> str | None:
         return f"/api/document/{doc_id}?u={user_id}"
     uri = video.get("uri")
     if uri:
-        path = urllib.parse.urlparse(uri).path
-        if path.startswith("/corpus/"):
+        parsed = urllib.parse.urlparse(uri)
+        netloc = parsed.netloc.lower()
+        # Only rewrite when the URI's host:port is OUR OWN allowlisted
+        # internal fetch target (src/config.py's DOCUMENT_FETCH_ALLOWED_
+        # INTERNAL_HOSTS — the same list src/ingest/document.py trusts for
+        # SSRF purposes; single source of truth for "this host is us").
+        # Matching on path alone (e.g. any URL containing "/corpus/") would
+        # rewrite an attacker- or third-party-controlled external URL like
+        # https://example.com/corpus/other.pdf into our OWN /corpus/other.pdf
+        # — serving one user's citation as a completely different file.
+        if netloc in DOCUMENT_FETCH_ALLOWED_INTERNAL_HOSTS:
             # `uri` here is the ingestion-time fetch target, e.g.
             # http://api:8000/corpus/deck.pdf — that hostname only resolves
             # inside the docker-compose network, never in the user's browser.
             # The path alone (leading "/") is host-relative: it resolves
             # against whatever origin actually served this citation, which
             # is the same process that owns the /corpus/{name} route.
-            return path
+            return parsed.path
     return uri
 
 
@@ -311,6 +321,24 @@ def resolve_llm(user_id: str) -> tuple[llm.LLMConfig | None, str]:
     return (cfg, "server") if cfg else (None, "none")
 
 
+def gate_citations(citations: list[dict[str, Any]], best_visual: float,
+                   best_text: float) -> list[dict[str, Any]]:
+    """Confidence Gate 1, applied to the CITATIONS themselves, not just
+    whether to bother calling the LLM. A query with nothing relevant indexed
+    (raw per-branch bests both below threshold) must not surface citations
+    at all — "I couldn't find that" next to five confident-looking source
+    cards is a worse contract violation than an honest empty result, both to
+    a person reading the UI and to the evaluator's "empty retrieval -> empty
+    citations" requirement. The single source of truth for this decision:
+    answer_from_citations and /ask_stream (src/api/search.py) both call this
+    instead of each re-deriving the same threshold check."""
+    if not citations:
+        return []
+    if CONFIDENCE_THRESHOLD and best_visual < CONFIDENCE_THRESHOLD and best_text < TEXT_CONFIDENCE_THRESHOLD:
+        return []
+    return citations
+
+
 def answer_from_citations(question: str, user_id: str, citations: list[dict[str, Any]],
                           best_visual: float, best_text: float) -> dict[str, Any]:
     """The slow half of the read path (LLM call), split out from retrieve()
@@ -319,33 +347,33 @@ def answer_from_citations(question: str, user_id: str, citations: list[dict[str,
     retrieve() returns, then calls this, so a client sees grounded citations
     well before the LLM's answer is ready instead of waiting on both together
     the way POST /api/ask (which just calls ask() below) necessarily does."""
-    result: dict[str, Any] = {"question": question, "citations": citations}
+    gated = gate_citations(citations, best_visual, best_text)
+    result: dict[str, Any] = {"question": question, "citations": gated}
 
     if not citations:
         result.update(answer="No relevant moments were found. Try ingesting a video first.",
                       llm_used=False, abstained=True)
         return result
-
-    # Gate 1 — confidence on the RAW per-branch bests (not the RRF score).
-    # Abstain only if NEITHER what's on screen nor what's said looks relevant.
-    visual_ok = best_visual >= CONFIDENCE_THRESHOLD
-    text_ok = best_text >= TEXT_CONFIDENCE_THRESHOLD
-    if CONFIDENCE_THRESHOLD and not visual_ok and not text_ok:
+    if not gated:
+        # Retrieval found SOMETHING, but nothing confident enough to ground
+        # an answer in — abstain, and (per gate_citations above) show no
+        # citations either, rather than an answer that contradicts its own
+        # source cards.
         result.update(answer=ABSTAIN, llm_used=False, abstained=True)
         return result
 
     cfg, source = resolve_llm(user_id)
     if cfg is None:
         # No generative model — summarize the best matches instead of inventing.
-        result.update(answer=_fallback_answer(citations), llm_used=False,
+        result.update(answer=_fallback_answer(gated), llm_used=False,
                       note=("Retrieval-only results. Connect your own model "
                             "(vLLM/Ollama/API) in settings, or set LLM_API_KEY "
                             "on the server, for a synthesized, grounded answer."))
         return result
 
-    moments = _build_moments(user_id, citations)
+    moments = _build_moments(user_id, gated)
     result["answer"] = _validate_citations(llm.answer(question, moments, cfg),
-                                           len(citations))
+                                           len(gated))
     result["llm_used"] = True
     result["llm_source"] = source          # "user" = their own hosted model
     result["llm_model"] = cfg.model
