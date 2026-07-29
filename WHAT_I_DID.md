@@ -656,8 +656,13 @@ clear-margin pass is stronger than reverting to an equally-unvalidated older num
      call; giving it its own process and its own lock means it can never contend with ingest's
      bulk embeds in the first place, not just wait less long for the same lock. Added a matching
      warmup in `src/app.py`'s lifespan (mirrors `clip_service.py`'s own pattern) so the first search
-     isn't slow, and removed the now-dead `/embed/query` endpoint from `clip_service.py` (nothing
-     called it once ingestion kept using `/embed/docs` and search stopped calling it at all).
+     isn't slow. `/embed/query` on `clip_service.py` is now dead code from our own code's
+     perspective — nothing calls it — but kept, explicitly marked deprecated, as a rolling-deploy
+     safety net: Fly replaces machines per-process-group, not as one atomic cross-group cutover, so
+     an old-image api machine could briefly still be calling this route while a new-image clip
+     machine is already serving. A first pass removed it outright; a second review round flagged
+     the deployment-transition risk, which is real enough (and the endpoint cheap enough to keep)
+     that removal wasn't the right call.
 
   Added `tests/test_block_i_reliability.py` (17 stdlib-unittest tests, no live stack): the Qdrant
   retry's success/failure/exhaustion/non-retryable paths, the embed_docs/embed_query routing

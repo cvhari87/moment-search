@@ -79,3 +79,18 @@ def embed_text(req: TextRequest):
 @app.post("/embed/docs")
 def embed_docs(req: DocsRequest):
     return {"vectors": embeddings.embed_docs_local(req.texts).tolist()}
+
+
+@app.post("/embed/query")
+def embed_query(req: TextRequest):
+    """DEPRECATED — nothing in this codebase calls this anymore: the API now
+    always embeds search queries locally (embeddings.embed_query, see
+    src/app.py's startup warmup), never over HTTP, so it never contends with
+    this service's bulk document-embedding lock. Kept only as a rolling-
+    deployment safety net: during a Fly deploy, an old-image api machine can
+    briefly keep serving traffic while a new-image clip machine is already
+    up (Fly replaces machines per-process-group, not as one atomic
+    cross-group cutover) — that old api code still calls this route. Safe
+    to delete once no api machine older than this endpoint's removal is
+    running."""
+    return {"vector": embeddings.embed_query_local(req.text).tolist()}
