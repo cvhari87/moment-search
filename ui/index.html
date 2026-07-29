@@ -85,6 +85,10 @@
       </div>
     </div>
     <div id="addControls">
+      <div id="tokenRow" class="flex gap-2 flex-wrap mb-2">
+        <input id="adminToken" type="password" autocomplete="off" placeholder="Admin token (required to add/remove videos on this server)"
+          class="flex-1 min-w-[220px] bg-white border border-line rounded-xl px-4 py-2 text-xs outline-none focus:border-coral">
+      </div>
       <div id="tab-yt" class="flex gap-2 flex-wrap">
         <input id="ytUrl" type="text" placeholder="https://youtube.com/watch?v=…"
           class="flex-1 min-w-[220px] bg-white border border-line rounded-xl px-4 py-2.5 text-sm outline-none focus:border-coral">
@@ -183,6 +187,19 @@ function renderMarkdown(md){
   closeUl(); return html;
 }
 
+/* ---------- admin token (mutating endpoints are Bearer-gated; the UI never
+   sent one, so every add/retry/delete 401'd whenever ADMIN_TOKEN was set —
+   which it always is outside throwaway local dev. sessionStorage: available
+   to every fetch call below, cleared when the tab closes, never written to
+   disk like localStorage would be) ---------- */
+function getToken(){ return sessionStorage.getItem("ms_admin_token")||""; }
+function authHeaders(){ const t=getToken(); return t?{"Authorization":"Bearer "+t}:{}; }
+const tokenEl=$("#adminToken");
+if(tokenEl){
+  tokenEl.value=getToken();
+  tokenEl.addEventListener("input",()=>sessionStorage.setItem("ms_admin_token",tokenEl.value.trim()));
+}
+
 /* ---------- config + library ---------- */
 async function loadConfig(){
   try{ const c=await (await fetch("/api/config")).json(); const b=$("#llmBadge");
@@ -258,14 +275,15 @@ async function loadVideos(){
   // retry a failed ingest — re-queues it on the worker
   if(del) box.querySelectorAll("[data-retry]").forEach(btn=>btn.onclick=async(e)=>{
     e.stopPropagation();
-    await fetch("/api/videos/"+encodeURIComponent(btn.dataset.retry)+"/retry",{method:"POST"});
+    const r=await fetch("/api/videos/"+encodeURIComponent(btn.dataset.retry)+"/retry",{method:"POST",headers:authHeaders()});
+    if(!r.ok){ const d=await r.json().catch(()=>({})); alert(d.detail||"Retry failed."); return; }
     loadVideos(); startRefresher();
   });
   // trash = permanent delete, with a confirm so it's never an accident
   if(del) box.querySelectorAll("[data-del]").forEach(btn=>btn.onclick=async(e)=>{
     e.stopPropagation();
     if(!confirm(`Delete “${btn.dataset.title}”?\n\nThis permanently removes its frames and search vectors. This can’t be undone.`)) return;
-    const r=await fetch("/api/videos/"+encodeURIComponent(btn.dataset.del),{method:"DELETE"});
+    const r=await fetch("/api/videos/"+encodeURIComponent(btn.dataset.del),{method:"DELETE",headers:authHeaders()});
     if(!r.ok){ const d=await r.json().catch(()=>({})); alert(d.detail||"Delete failed."); return; }
     KNOWN.delete(btn.dataset.del); SELECTED.delete(btn.dataset.del); loadVideos();
   });
@@ -310,7 +328,7 @@ async function registerIngest(body, btns){
   const st=$("#ingestStatus");
   try{
     const resp=await fetch("/api/videos",{method:"POST",
-      headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)});
+      headers:{"Content-Type":"application/json",...authHeaders()}, body:JSON.stringify(body)});
     if(!resp.ok){ const e=await resp.json().catch(()=>({})); throw new Error(e.detail||resp.statusText); }
     await resp.json();
     st.textContent="Queued — processing in the background. Add another anytime.";
@@ -326,7 +344,7 @@ $("#upBtn").onclick=async()=>{ const f=$("#upFile").files[0]; if(!f)return;
   try{
     st.textContent="Uploading…";
     const pre=await fetch("/api/videos/presign",{method:"POST",
-      headers:{"Content-Type":"application/json"},
+      headers:{"Content-Type":"application/json",...authHeaders()},
       body:JSON.stringify({filename:f.name,content_type:f.type||"video/mp4",size:f.size})});
     if(!pre.ok){ const e=await pre.json().catch(()=>({})); throw new Error(e.detail||pre.statusText); }
     const p=await pre.json();
