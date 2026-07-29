@@ -677,3 +677,132 @@ two competing dispatcher instances against real Prefect Cloud and checking the r
 reasoning about probabilities from a desk. Reasoning ("this race window is sub-millisecond, so it's
 safe") was tried first and was wrong; only live testing under the actual adversarial condition
 (two dispatchers, same pending row, real network latency) gave a trustworthy answer.
+
+## A working single-flow pattern doesn't automatically generalize to multiple flows
+
+`ingest_video.serve(name="ingest", limit=limit)` had worked, unmodified, since Section A. Adding a
+second flow by switching to the module-level `serve(video.to_deployment(...),
+document.to_deployment(...))` seemed like the obvious, minimal change — same underlying Prefect
+primitives, just two of them instead of one. It broke *both* flows, including the one that had
+never been touched, with a relative-import error at flow-run time.
+
+The two call shapes are not equivalent even though the docs describe `.serve()` as a convenience
+wrapper around the same machinery: `to_deployment()`'s default `entrypoint_type` serializes the
+flow's location as a bare file path, and whatever code path actually loads that entrypoint at
+flow-run time treats a file path differently from however `.serve()`'s own internal bookkeeping
+had been resolving it — enough to change whether the flow's module is loaded as a real package
+member (relative imports work) or executed as a standalone script (they don't). The fix
+(`entrypoint_type=EntrypointType.MODULE_PATH`) was one keyword argument, but finding it required
+reading the installed library's actual source rather than assuming "this is basically the same
+call, just called twice."
+
+The general lesson: when a framework offers two API surfaces that produce superficially similar
+results (one flow served vs. many, one deployment vs. several), don't assume the multi-item form
+is just a loop over the single-item form's internals. Verify the specific mechanism — here, by
+reading `import_object()`'s actual branching logic in the installed `prefect` package — rather than
+extrapolating from "it's the same library, it should work the same way."
+
+## An error message can be real and still point at the wrong layer
+
+The browser UI's "Missing or invalid bearer token" error is the literal, correct response from the
+server's auth check — but the natural next question ("why is auth rejecting me?") leads toward the
+token's *value* (wrong token? expired? typo?) when the actual defect was that the UI never sent a
+token *at all*. The fix wasn't about the token being wrong; it was that an entire code path
+(`Authorization` headers on mutating `fetch()` calls) had simply never been written in the first
+place.
+
+Confirming this took reading the actual client code (`ui/index.html`'s `fetch()` calls) rather than
+reasoning from the error message alone, and checking `git log` on that file to establish it predated
+every change made this session — the fix needed to add a missing capability (a token input +
+header-attachment helper), not debug an existing one. An error string names the check that failed;
+it doesn't always name the reason the check had nothing to check against.
+
+## Security hardening: scope the exception to the specific need, not the general category it falls under
+
+The document fetcher's SSRF fix went through two passes, and the first pass's own reasoning is
+worth keeping precisely because it was a real, live-tested improvement that still wasn't tight
+enough. Pass one: block loopback/link-local/metadata but allow all of RFC1918, because the deck is
+deliberately self-hosted at a docker-compose-internal address (`http://api:8000/...`) which lives
+in that private space — a blanket "block all private ranges" would have broken that legitimate,
+intended fetch. True, and verified both directions (dangerous addresses rejected, the deck's own
+fetch still worked). But the fix generalized the exception to the wrong *category*: "this app needs
+ONE specific private host, therefore allow the entire private-address space" is a much bigger
+exception than the actual need. An admin-token holder could use that same permissiveness to probe
+any *other* service on the private network — internal databases, dashboards, other containers —
+none of which this app has any legitimate reason to reach.
+
+Pass two fixed the actual mismatch: block every private/loopback/link-local/reserved address by
+default, and allowlist the *specific hostname* (`api`) the app actually needs — not the address
+range it happens to fall in. The lesson generalizes past SSRF: when a legitimate need requires
+punching a hole in a security boundary, scope the hole to the exact thing that needs to get
+through (one hostname), not the general category that thing belongs to (an entire private /8
+block) — the category is almost always bigger than the need, and the gap between them is exactly
+the residual exposure. Re-verifying after tightening still meant testing both directions again:
+confirm the now-broader block list actually rejects what it should (10.x, 172.16.x, 192.168.x, not
+just loopback/metadata), and confirm the one allowlisted case still works end-to-end.
+
+A related, easy-to-miss gap in the SAME fix: validating a hostname's resolved IP and then handing
+the ORIGINAL HOSTNAME (not the validated IP) to the HTTP client for the actual connection leaves a
+DNS-rebinding window — the client re-resolves the hostname at connect time, which could return a
+different address than what was just validated. Closing it required pinning the actual TCP
+connection to the specific IP already validated (while still presenting the correct hostname for
+TLS SNI/certificate checks) — validating a value and then not actually using that same validated
+value for the operation it was validated for is a subtle way for a check to become decorative.
+
+## A "reset to pending on re-registration" default silently assumes registration only ever happens once per lifecycle
+
+`upsert_pending`'s original behavior — always reset status to `pending` on conflict — was correct
+for the common case (registering something new, or retrying something that already finished) and
+wrong for a case nobody had designed for: re-registering something that was *currently running*.
+Nothing about the function signature or its callers made that distinction visible; the bug only
+showed up as two Prefect run IDs processing the same document simultaneously in a live log, not as
+a code-review-visible defect.
+
+The fix (preserve status when already in-flight, reset only from terminal-ish states) is a
+one-line change in principle, but finding it required noticing that "re-registration" is not one
+event with one correct response — it's at least three different situations (new source, retry a
+finished/failed one, accidental duplicate of a running one) that had been handled with a single
+unconditional code path. The same gap existed in a second, unrelated call site (the video retry
+endpoint, which sets status directly rather than through `upsert_pending`) — a reminder that when a
+race is rooted in "an operation doesn't check current state before overwriting it," every call site
+that performs that same kind of overwrite needs the same audit, not just the one where the race was
+first observed.
+
+## A narrow mitigation and the full architectural fix are different deliverables — say which one you're doing
+
+Closing the re-registration path stopped the *observed* trigger of the duplicate-run race, but a
+deeper version of the same problem remains open: a dispatcher retry after a timed-out enqueue, a
+queued-but-delayed run starting late, or a future staleness sweep resetting a row while the
+original run is still alive — none of which go through `upsert_pending` at all, so that fix doesn't
+touch them. The complete answer is a generation/lease token stamped at admission time and checked
+by every status write before it's allowed to apply — real, understood, and NOT built here.
+
+The choice made instead: a narrow, one-line guard (a `failed` write can't overwrite an already
+`indexed` row) that closes the single most damaging *consequence* of the race — a late failure
+clobbering a real success — without closing the race itself. That's a legitimate, honest thing to
+ship, but only if it's labeled as what it is. The risk in a moment like this isn't picking the
+smaller fix; it's letting the smaller fix quietly stand in for the bigger one in memory or
+documentation. Writing "narrow stale-write guard, not a full fencing mechanism" directly in the
+function's own docstring — not just in a commit message or a chat reply — is what keeps that
+distinction from evaporating the next time someone (human or agent) reads the code without this
+conversation's context and reasonably assumes a guard against overwriting means the race is solved.
+
+## Guarding the last transition isn't the same as guarding the state
+
+The first version of the stale-write guard blocked exactly the transition that had actually been
+observed racing: `indexed -> failed`. It felt complete because it was tested against the real bug.
+It wasn't complete, because a stale run doesn't necessarily fail *immediately* — its real lifecycle
+walks through every intermediate status (`parsing`, `embedding`) before it ever reaches `failed`,
+and the FIRST of those intermediate writes already clobbers `indexed`. By the time the stale run's
+own `failed` write happens, the guard's condition (`current status is indexed`) is no longer true —
+the stale run itself made it false a few statements earlier. A guard written against "the last thing
+that goes wrong" instead of "the state that must be protected" has a hole exactly where the failure
+mode has more than one step.
+
+The fix was to invert the framing: instead of listing the specific bad transition to block
+(`indexed -> failed`), protect the state itself (once `indexed`, nothing but a deliberate reset
+applies) — every write attempt is refused, not just the one shaped like the observed bug. Verifying
+this required literally replaying the multi-step sequence (`indexed`, then `parsing`, then
+`embedding`, then `failed`, as separate calls) rather than testing the single transition that had
+been fixed — because a fix that's tested only against the exact reproduction that motivated it will
+reliably pass that one test while leaving the general case, which produced it, still open.
