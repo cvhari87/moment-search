@@ -29,6 +29,7 @@ from ..config import (
     ADMIN_TOKEN,
     ALLOWED_UPLOAD_TYPES,
     DEFAULT_USER_ID,
+    INFLIGHT_STATUSES,
     MAX_UPLOAD_MB,
     UPLOAD_KEY_PREFIX,
 )
@@ -142,14 +143,18 @@ def register(req: RegisterRequest, uid: str = Depends(user_id)):
     else:
         raise HTTPException(400, "Provide either url (YouTube) or video_id+key (upload).")
 
-    # Always leave it `pending` for the dispatcher (src/dispatcher.py) to admit
-    # — never enqueue directly here. A direct enqueue plus this row still
-    # reading `pending` used to race the dispatcher's own claim (both would
-    # admit it, producing two Prefect runs for one video): enqueue_video()
-    # doesn't itself update status, and Prefect scheduling latency can easily
-    # exceed one dispatcher tick. ENABLE_FAIR_DISPATCH now only selects WFQ
-    # vs FIFO ordering inside db.wfq_claim, not which path enqueues.
-    return {"video_id": row["id"], "status": "pending"}
+    # Always leave it for the dispatcher (src/dispatcher.py) to admit — never
+    # enqueue directly here. A direct enqueue plus this row still reading
+    # `pending` used to race the dispatcher's own claim (both would admit it,
+    # producing two Prefect runs for one video): enqueue_video() doesn't
+    # itself update status, and Prefect scheduling latency can easily exceed
+    # one dispatcher tick. ENABLE_FAIR_DISPATCH now only selects WFQ vs FIFO
+    # ordering inside db.wfq_claim, not which path enqueues.
+    # row["status"], not a hardcoded "pending": upsert_pending leaves an
+    # already in-flight row's status untouched (see its docstring) rather
+    # than resetting it, so a re-registration of something already running
+    # correctly reports its real state instead of falsely claiming "pending".
+    return {"video_id": row["id"], "status": row["status"]}
 
 
 # ── Status / lifecycle ─────────────────────────────────────────────────────────
@@ -168,7 +173,14 @@ def _public(row: dict) -> dict:
 
 @router.get("")
 def list_videos(uid: str = Depends(user_id), status: str | None = None):
-    return {"videos": [_public(r) for r in db.list_videos(uid, status=status)]}
+    # db.list_videos() is kind-agnostic (also used by GET /admin/sources, which
+    # correctly wants every kind) — this endpoint is video-specific, so filter
+    # here. Without this, papers/decks showed up in the UI's "Your videos"
+    # panel mislabeled with a nonsensical frame_count/upload badge. Full
+    # multi-kind rendering is Block F's job; this just keeps this endpoint
+    # honest about what it's named.
+    rows = [r for r in db.list_videos(uid, status=status) if r.get("kind", "video") == "video"]
+    return {"videos": [_public(r) for r in rows]}
 
 
 @router.get("/{video_id}")
@@ -184,6 +196,12 @@ def retry(video_id: str, uid: str = Depends(user_id)):
     row = db.get_video(video_id)
     if row is None or row["user_id"] != uid:
         raise HTTPException(404, "Video not found.")
+    if row["status"] in INFLIGHT_STATUSES:
+        # Already running — resetting to pending here would let the
+        # dispatcher admit a SECOND run for the same row (the same race
+        # upsert_pending's ON CONFLICT now guards against; retry needs its
+        # own guard since it calls set_status directly, not upsert_pending).
+        return {"video_id": video_id, "status": row["status"]}
     db.set_status(video_id, "pending", error=None)
     return {"video_id": video_id, "status": "pending"}  # dispatcher re-admits it (see register())
 

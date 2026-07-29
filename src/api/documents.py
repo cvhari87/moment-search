@@ -12,7 +12,9 @@ need no rewrite to fairly admit documents alongside videos.
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import re
+import urllib.parse
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
@@ -24,6 +26,25 @@ router = APIRouter(prefix="/admin", tags=["documents"])
 
 _URI_RE = re.compile(r"^https?://\S+$")
 _KINDS = ("paper", "deck")
+
+
+def _obviously_unsafe_host(uri: str) -> bool:
+    """Cheap, no-DNS reject for literal blocked-range IPs (loopback,
+    link-local — 169.254.169.254 cloud metadata most of all — private
+    RFC1918, multicast, reserved) typed directly into the uri — a fast first
+    line of defense that stays well inside the sub-300ms budget. Domain
+    names pass through untouched, INCLUDING our own allowlisted "api"
+    hostname (it isn't a literal IP, so it never reaches this check at all);
+    the authoritative, DNS-resolved, allowlist-aware, redirect-safe check
+    runs at fetch time in src/ingest/document.py, not here — registration
+    must not do a network call."""
+    host = (urllib.parse.urlparse(uri).hostname or "").strip("[]")
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False  # a domain name, not a literal IP — resolved later
+    return (ip.is_loopback or ip.is_link_local or ip.is_private
+            or ip.is_multicast or ip.is_unspecified or ip.is_reserved)
 
 
 def _doc_id(user_id: str, uri: str) -> str:
@@ -51,6 +72,9 @@ def register_document(req: RegisterDocument, uid: str = Depends(user_id)):
     if not _URI_RE.match(uri):
         raise HTTPException(400, "uri must be http(s) — fetchability is checked "
                                  "during ingestion, not at registration time.")
+    if _obviously_unsafe_host(uri):
+        raise HTTPException(400, "uri resolves to a non-public address range "
+                                 "(loopback / link-local / private / metadata).")
     doc_id = _doc_id(uid, uri)
     row = db.upsert_pending({
         "id": doc_id, "user_id": uid, "source": "document",

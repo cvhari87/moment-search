@@ -104,9 +104,21 @@ def init_schema() -> None:
 
 def upsert_pending(video: dict[str, Any]) -> dict:
     """Insert a source (video, paper, or deck) as pending; re-submitting an
-    existing id resets it. `kind` defaults to 'video' so every existing
-    caller (src/api/videos.py) works unchanged; documents pass kind + uri."""
-    video = {"kind": "video", "uri": None, **video}
+    existing id resets it to pending — UNLESS a run is already actively
+    in-flight for it, in which case status/error/progress are left alone.
+
+    Without that guard, re-registering something already running (a real
+    scenario: eval.py's documents_async check re-submits the locked paper,
+    and a user can just double-click Ingest) unconditionally flipped the row
+    back to 'pending', and the dispatcher would fairly re-admit it — while
+    the ORIGINAL run was still executing. Observed live: two distinct Prefect
+    run IDs processing the same doc_id simultaneously, both completing and
+    racing to write the row's terminal status last. Deterministic Qdrant
+    point IDs made the double-embed harmless, but nothing stopped a slower,
+    stale run from overwriting a newer run's 'indexed' with its own (possibly
+    'failed') outcome. `kind` defaults to 'video' so every existing caller
+    (src/api/videos.py) works unchanged; documents pass kind + uri."""
+    video = {"kind": "video", "uri": None, "inflight": list(INFLIGHT_STATUSES), **video}
     with pool().connection() as conn:
         row = conn.execute(
             """
@@ -121,7 +133,13 @@ def upsert_pending(video: dict[str, Any]) -> dict:
                 title = COALESCE(EXCLUDED.title, ms_videos.title),
                 uri = COALESCE(EXCLUDED.uri, ms_videos.uri),
                 kind = EXCLUDED.kind,
-                status = 'pending', error = NULL, progress = NULL, updated_at = now()
+                status = CASE WHEN ms_videos.status = ANY(%(inflight)s)
+                              THEN ms_videos.status ELSE 'pending' END,
+                error = CASE WHEN ms_videos.status = ANY(%(inflight)s)
+                             THEN ms_videos.error ELSE NULL END,
+                progress = CASE WHEN ms_videos.status = ANY(%(inflight)s)
+                                THEN ms_videos.progress ELSE NULL END,
+                updated_at = now()
             RETURNING *
             """,
             video,
@@ -133,28 +151,59 @@ def set_status(video_id: str, status: str, *, error: str | None = None,
                title: str | None = None, frame_count: int | None = None,
                source_hash: str | None = None, embed_version: str | None = None,
                progress: float | None = None, chunk_count: int | None = None) -> None:
+    """Narrow stale-write guard, not a full fencing mechanism: once a row is
+    'indexed', NO further write from this function applies to it UNLESS the
+    new status is 'pending' (the one legitimate way anything un-terminals an
+    indexed row: a fresh, deliberate re-registration through
+    upsert_pending()). This is stronger than an earlier version that only
+    blocked a direct indexed->failed write: a stale run doesn't necessarily
+    fail immediately — it can walk indexed->parsing->embedding->failed,
+    clobbering 'indexed' with 'parsing' well before its own eventual
+    'failed' write, which the narrower check never saw coming since the row
+    was no longer 'indexed' by the time that write happened. Blocking every
+    non-'pending' write while current status is 'indexed' closes that: a
+    stale run's parsing/chunking/embedding/failed calls all become no-ops
+    from the moment a newer run's 'indexed' has landed, not just its last one.
+
+    Still NOT full fencing: this protects the 'indexed' terminal state
+    specifically, not general ordering between two concurrent runs (which
+    deterministic Qdrant point IDs already make safe for duplicate WORK,
+    just not for which run's status write "wins"). A generation/lease token
+    per admission, checked by every status write, is the complete answer —
+    that's Block G's admission-time resilience work, spanning the
+    dispatcher, jobs, and both ingest flows, not a one-function patch."""
     with pool().connection() as conn:
         conn.execute(
             """
-            UPDATE ms_videos SET status = %s, error = %s,
-                title = COALESCE(%s, title),
-                frame_count = COALESCE(%s, frame_count),
-                source_hash = COALESCE(%s, source_hash),
-                embed_version = COALESCE(%s, embed_version),
-                progress = %s,
-                chunk_count = COALESCE(%s, chunk_count),
+            UPDATE ms_videos SET status = %(status)s, error = %(error)s,
+                title = COALESCE(%(title)s, title),
+                frame_count = COALESCE(%(frame_count)s, frame_count),
+                source_hash = COALESCE(%(source_hash)s, source_hash),
+                embed_version = COALESCE(%(embed_version)s, embed_version),
+                progress = %(progress)s,
+                chunk_count = COALESCE(%(chunk_count)s, chunk_count),
                 updated_at = now()
-            WHERE id = %s
+            WHERE id = %(video_id)s
+              AND (status != 'indexed' OR %(status)s = 'pending')
             """,
-            (status, error, title, frame_count, source_hash, embed_version,
-             progress, chunk_count, video_id),
+            {"status": status, "error": error, "title": title, "frame_count": frame_count,
+             "source_hash": source_hash, "embed_version": embed_version, "progress": progress,
+             "chunk_count": chunk_count, "video_id": video_id},
         )
 
 
 def set_progress(video_id: str, progress: float) -> None:
+    """Same 'indexed' guard as set_status() — a stale run's own progress
+    callbacks (video sampling/embedding report progress many times per run)
+    shouldn't cosmetically overwrite an already-indexed row's progress
+    either, even though a stray progress value is lower-severity than a
+    stray status."""
     with pool().connection() as conn:
-        conn.execute("UPDATE ms_videos SET progress = %s, updated_at = now() WHERE id = %s",
-                     (round(progress, 3), video_id))
+        conn.execute(
+            "UPDATE ms_videos SET progress = %s, updated_at = now() "
+            "WHERE id = %s AND status != 'indexed'",
+            (round(progress, 3), video_id),
+        )
 
 
 def bump_attempts(video_id: str) -> int:

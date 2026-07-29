@@ -110,7 +110,7 @@ ALLOWED_UPLOAD_TYPES = ("video/",)                         # content-type must s
 VIDEO_STATUSES = ("pending", "queued", "fetching", "sampling", "embedding",
                   "indexed", "skipped", "failed")
 # In-flight = occupying execution capacity (scheduled or running).
-INFLIGHT_STATUSES = ("queued", "fetching", "sampling", "embedding")
+INFLIGHT_STATUSES = ("queued", "fetching", "sampling", "parsing", "chunking", "embedding")
 
 # --- Fair scheduling (WFQ) ----------------------------------------------------
 # FIFO (default off): register enqueues to Prefect immediately -> Prefect runs
@@ -197,6 +197,38 @@ TEXT_EMBED_VERSION = os.getenv("TEXT_EMBED_VERSION", f"{TEXT_EMBED_MODEL}-v1")
 TRANSCRIPT_CHUNK_SECONDS = _float("TRANSCRIPT_CHUNK_SECONDS", 20.0)
 TRANSCRIPT_LANGS = [c.strip() for c in
                     os.getenv("TRANSCRIPT_LANGS", "en,en-US,en-GB").split(",") if c.strip()]
+
+# --- Document ingest (papers, decks — Path 2) -----------------------------------
+# Reuses TEXT_COLLECTION / TEXT_EMBED_* above: a paper/deck chunk is a text chunk
+# like a transcript chunk, just with a page/slide locator instead of t_start/t_end.
+# Chunking is page-aware, not time-aware: a chunk never spans two pages (the page
+# number IS the locator), so pages are split independently into ~CHUNK_CHARS
+# passages — same "coherent passage, not too small/large" sizing spirit as
+# TRANSCRIPT_CHUNK_SECONDS, sized in characters instead of seconds since pages
+# have no timeline. ~1000 chars ≈ the 256-token chunk size the RAG survey itself
+# recommends (arXiv 2312.10997, p.8).
+DOCUMENT_CHUNK_CHARS = _int("DOCUMENT_CHUNK_CHARS", 1000)
+# A byte cap alone doesn't bound worst case: a 50MB PDF of mostly-text pages
+# can still expand into tens of thousands of chunks, each an embedding call
+# and a Qdrant point. Cap total chunks so one pathological document can't
+# balloon a single embed_docs() call or dominate a worker indefinitely.
+DOCUMENT_MAX_CHUNKS = _int("DOCUMENT_MAX_CHUNKS", 2000)
+# Fetch cap for POST /admin/documents' uri (paper/deck PDFs) — bounds a single
+# download's memory and time; a poison/oversized URI fails the fetch task
+# cleanly (Prefect retries, then the flow fails) rather than hanging a worker.
+DOCUMENT_FETCH_MAX_MB = _int("DOCUMENT_FETCH_MAX_MB", 50)
+# SSRF hardening (src/ingest/document.py): every other private/loopback/
+# link-local/reserved address is blocked outright. These specific host:port
+# pairs are the ONLY exception — an explicit allowlist, not a private-IP
+# range or bare-hostname exception (a bare hostname would let a document uri
+# hit ANY port on that host, not just the one this app actually serves on —
+# unnecessarily wide for what's actually needed). "api:8000" is this
+# project's own docker-compose service (the deck is self-hosted there); add
+# the exact Fly internal host:port here too once deployed (Block J).
+DOCUMENT_FETCH_ALLOWED_INTERNAL_HOSTS = [
+    h.strip().lower() for h in os.getenv("DOCUMENT_FETCH_ALLOWED_INTERNAL_HOSTS", "api:8000").split(",")
+    if h.strip()
+]
 
 # --- Fusion (multimodal retrieval) ---------------------------------------------
 # RRF: rank-based fusion across branches (score-agnostic). rrf = 1/(K + rank).
