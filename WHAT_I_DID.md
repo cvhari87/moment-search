@@ -463,11 +463,9 @@ by URL and never needed one. Added `POST /admin/documents/upload` (multipart fil
 title) — no presign step, since a PDF capped at `DOCUMENT_FETCH_MAX_MB` is cheap enough to pass
 through the API process directly (presigning exists for videos because those are large enough that
 routing gigabytes through this process would be wasteful, not because a bypass is required in
-principle). The upload handler writes bytes to the same place the corpus deck already lives
-(`data/corpus/`, served by the existing `GET /corpus/{name}` route) for local dev, or to real
-object storage with a presigned GET URL when `storage.presign_capable()` — either way it hands off
-to the exact same uri-based registration path already built and reviewed in Block D, so the
-SSRF-hardened fetch logic in `src/ingest/document.py` is reused, not duplicated.
+principle). *(This first cut wrote bytes to the same public `data/corpus/` path the deck lives at,
+or to a presigned GET URL, and handed off to the URI-based registration path — both were replaced
+by the durable, private `storage_key` design below the same day; see "document upload hardening.")*
 
 Added a "Your documents" panel to the UI mirroring the video library's structure — file picker,
 paper/deck selector, title field, status list with retry/delete. Retry and delete reuse the
@@ -483,10 +481,124 @@ correct 7 chunks; confirmed auth is enforced (401 without a token), kind validat
 `kind=video`, and content validation rejects a non-PDF file even with a `.pdf` extension. User then
 confirmed it works via the actual browser UI.
 
+## 2026-07-29 — Document upload hardening
+
+Status: **complete**
+
+Independent review of the upload feature (previous entry) found four P1s, all confirmed live:
+cloud uploads stored a presigned GET as the permanent `uri`, which expires in an hour and mints a
+new URL (and doc_id) on every re-upload of identical bytes; local uploads landed in the public
+`corpus/` prefix, servable to anyone with no auth; deleting a document left its PDF and
+parse/chunk checkpoints behind; the UI never added indexed documents to the query-selection list.
+Fixed by giving uploads a durable, private `storage_key` (`documents/{user}/{sha256}.pdf`, no HTTP
+route) that `src/ingest/document.py` reads directly via `storage.get_bytes()` — no fetch, no
+expiry, no public exposure, and re-uploading identical bytes resolves to the same `doc_id`
+(content-hash identity). Delete now purges checkpoints via a new `doc_prefix()` helper. Migrated
+the one legacy document row that predated this fix off the public `corpus/` path.
+
+## 2026-07-29 — Block E: deck slice by parameterization
+
+Status: **complete**
+
+Papers and decks are one parameterized code path in `src/ingest/document.py`, not two modules:
+`KIND_SPEC = {"paper": "page", "deck": "slide"}` is the one thing that actually differs — the name
+of the locator field a chunk's Qdrant payload carries. Internally, parse/chunk still treat both as
+"the PDF page index"; only `t_embed` renames the field at the payload boundary, closing the
+deck-locator-key gap flagged in the previous entry's "Work to return to."
+
+Added the vision-caption branch: a deck slide whose extracted text is under `DECK_SLIDE_MIN_CHARS`
+(a title/diagram-only slide) is rendered via `page.get_pixmap(dpi=DECK_SLIDE_RENDER_DPI)` and
+captioned by the vision LLM (`llm.caption_image()`, new — reuses `answer()`'s per-provider
+client/downscale/base64 plumbing with a captioning system prompt instead of the video Q&A one),
+resolved through the same tenant-first/server-fallback `resolve_llm()` search.py already uses for
+query-time answers. Papers never take this branch — a sparse paper page is normal PDF reality, not
+a gap to fill. Checkpoint keys were versioned by `kind` + `_PARSE_VERSION` (done during the
+concurrent Block F session below, once it saw this branch land) so a deck's pre-caption checkpoint
+can never be silently reused after the semantics changed.
+
+Verified live, not just by self-report: re-ran the existing "One Index for Every Source" deck
+end-to-end — `/ask_stream` for `eval.py`'s exact hardcoded probe returns `locator: {"slide": 4}`,
+matching the graded expectation verbatim. Built a purpose-made synthetic 2-slide PDF (slide 1 =
+real paragraph text, slide 2 = only shapes, no text) to isolate the caption branch specifically:
+inspected the Qdrant payload directly and confirmed slide 1 kept its real text (branch correctly
+did NOT fire) while slide 2's payload text was the vision model's actual description of what was
+drawn ("a flag design... solid pink background... large navy blue circle..."). Cleaned up the test
+document and file after.
+
+## 2026-07-29 — Block F: cross-source retrieval + ask_stream
+
+Status: **complete**
+
+`_fuse()` previously bucketed every hit into time windows keyed on `t_start`/`ms`, which documents
+don't have — every chunk from the same paper/deck defaulted to `t=0` and collapsed into a single
+window, silently discarding all but one page/slide per document and having the UI try to open a
+document citation as a `<video>` tag. Fixed by branching on payload kind: document hits now bucket
+by exact `(video_id, page|slide)` instead of time proximity — one window per page/slide, no time
+merging. Citations now carry `kind`/`sourceId`/`locator` (`{page}` | `{slide}` |
+`{start_ms,end_ms}`) and `text` alongside every existing field, matching `eval.py`'s
+paper_indexed/deck_indexed/grounded checks literally.
+
+Added `GET /ask_stream` (SSE): emits a `citations` event first, then streams the synthesized
+answer — `POST /api/ask` is untouched. Two follow-up fixes to that endpoint: (1) Confidence Gate 1
+previously only decided whether to abstain from generating an answer, not whether to emit
+citations at all — a query with nothing genuinely relevant indexed could return a full citation
+list next to an "I couldn't find that" answer. Extracted `gate_citations()` as the single source of
+truth, applied before both the SSE citations event and answer synthesis. (2) The SSE citations
+event was text-filtered but `answer_from_citations()` still received the unfiltered list, so the
+LLM's positional `[n]` refs could point at a citation the client never saw — fixed by filtering
+once and threading that exact list through both steps.
+
+Also recalibrated `CONFIDENCE_THRESHOLD`/`TEXT_CONFIDENCE_THRESHOLD` (0.2/0.35 → 0.28/0.72) using
+new tooling (`benchmark/negative_queries.jsonl`, admin-only `GET /admin/debug/retrieve`,
+`benchmark/calibrate_thresholds.py`) — the old visual threshold sat below this corpus's CLIP noise
+floor, so the AND-gate's visual side could never reject a negative, making the text threshold
+irrelevant too. **Caveat surfaced by the guardrail review below and independently verified**: every
+positive in `queries.jsonl` is text/transcript-shaped, so this calibration never actually exercised
+a genuine visual-only citation (no strong transcript match, relying solely on the CLIP frame
+score). Built a throwaway synthetic silent video (a red frame with a solid blue rectangle, zero
+audio/transcript) to close that gap directly: queried it with purely visual phrasing and got
+`best_visual` 0.32–0.36 — comfortably clear of the new 0.28 threshold — while a genuinely
+irrelevant negative query scored 0.25, safely below it. That's real evidence the recalibration
+doesn't reject a clear visual-only match; it does not prove every possible subtle real-world visual
+moment clears it, which remains an open, lower-severity residual risk (see below). Deleted the test
+video after.
+
+## 2026-07-29 — Guardrail review of the above three entries
+
+A `momentsearch-reviewer` subagent reviewed the combined diff (upload hardening + Block E + Block
+F) against the 7 traps, security, and the literal rubric — the review these three entries didn't
+get individually before commit, since they landed from a concurrent session mid-flight rather than
+the usual one-block-at-a-time cadence.
+
+**P1, addressed**: the confidence recalibration's visual-only blind spot described above. Closed
+with the synthetic-video test rather than by reverting the threshold, since real evidence of a
+clear-margin pass is stronger than reverting to an equally-unvalidated older number.
+
+**P2s, two fixed**:
+- Vision-captured slide images were passed to `llm.caption_image()` as raw `pix.tobytes()`
+  (PyMuPDF's default PNG output) while the payload was hardcoded `image/jpeg` — latent, not
+  triggered under the shipped `DECK_SLIDE_RENDER_DPI=150` (renders exceed `LLM_IMAGE_MAX_PX` so
+  `_downscale()` always re-encodes to real JPEG), but a smaller custom DPI would silently degrade
+  or fail the caption call. Fixed by rendering via `pil_tobytes(format="JPEG")` instead, so the
+  bytes are always real JPEG regardless of DPI.
+- `POST /admin/documents/upload`'s docstring now explicitly states why its bounded, off-event-loop
+  storage PUT is a deliberate narrow exception to "ingestion never does synchronous work in the
+  request path" — the graded contract endpoint (`POST /admin/documents`, URI registration) still
+  does zero I/O before returning 202.
+
+**P2s, accepted as-is / deferred** (documented here so they aren't silently lost):
+- The upload endpoint still does its (bounded, threadpooled) storage write in the request path
+  rather than presigning — a real design tradeoff for a dev-convenience endpoint `eval.py` never
+  calls, not worth a presign-flow rebuild under assignment time constraints.
+- Checkpointing is per-document, not per-slide: a retry after a transient failure partway through
+  a large deck recaptions every already-processed slide, not just the failed one. Pre-existing
+  granularity (the paper path already re-parses wholesale on retry); the caption branch just makes
+  it more expensive. Worth revisiting if a real deck turns out large enough for this to matter.
+- `c2af9c7`'s legacy-document-row migration was confirmed only by absence (no orphaned public PDF
+  under `data/corpus/`) — the underlying Postgres row itself wasn't independently inspected.
+
 ## Work to return to
 
-- [ ] **Block E:** deck slice by parameterization (slide locator + vision-caption branch for
-  text-empty slides). Also the point to fix the deck payload's locator key from `page` to `slide`.
 - [ ] **Block G:** implement stale-ingest reconciliation; Prefect crash detection is not job
   redelivery (confirmed directly in the Section A2 crash experiment).
 - [ ] **Block G/K:** replace the `benchmark/bench.py --resilience` stub and prove zero dropped
@@ -494,6 +606,9 @@ confirmed it works via the actual browser UI.
 - [ ] **Block H:** implement the register-and-capture pattern for `bench.py`'s recall check (see
   round 3 above) rather than relying on the static `source_id` values recorded in
   `queries.jsonl`.
+- [ ] **Block H:** the four `bench.py` TODOs generally (recall@10, decoupling ratio, throughput,
+  resilience) — none built yet.
+- [ ] **Block I:** tune to pass (`sla.json` stays as-is).
 - [ ] **Block J:** create or select the permanent Fly app and update both `fly.toml`'s `app` value
   and `CLIP_SERVICE_URL` to the same app name.
 - [ ] **Block J:** verify the intended GitHub deployment branch after `fly launch`; it may rewrite
@@ -503,3 +618,5 @@ confirmed it works via the actual browser UI.
 - [ ] **Block J:** the deck's registered URI (`http://api:8000/...`) is docker-compose-internal —
   will need re-registering under Fly's internal or public hostname after redeploy, which will
   also change its `doc_id` (expected; see Block H's register-and-capture design above).
+- [ ] Minor, deferred: per-slide caption checkpointing and independent verification of the
+  `c2af9c7` legacy-row migration (see guardrail review above).

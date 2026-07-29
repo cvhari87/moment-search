@@ -132,6 +132,15 @@ async def upload_document(file: UploadFile = File(...), kind: str = Form(...),
     that routing gigabytes through this process would be wasteful, not
     because a bypass is required in principle.
 
+    This is a deliberate, narrow exception to "ingestion never does
+    synchronous work in the request path" (ASSIGNMENT_AGENTS.md non-
+    negotiable #1): the storage PUT here is bytes-in-hand, bounded by
+    DOCUMENT_FETCH_MAX_MB, and off the event loop (run_in_threadpool below)
+    — not the unbounded parse/chunk/embed work that non-negotiable #1 is
+    actually about, which stays worker-only via _register's insert-pending-
+    and-return. The graded contract endpoint (POST /admin/documents, the
+    uri-registration path above) does no I/O at all before returning.
+
     The bytes land under a PRIVATE, content-addressed key
     (documents/{user}/{sha256}.pdf) — never the public corpus/ prefix, which
     /corpus/{name} serves to anyone with no auth (that route exists only for

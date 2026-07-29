@@ -245,7 +245,13 @@ def _parse_pdf(data: bytes, kind: str, user_id: str) -> list[dict]:
             text = page.get_text()
             if kind == "deck" and len(text.strip()) < DECK_SLIDE_MIN_CHARS and caption_cfg is not None:
                 try:
-                    image = page.get_pixmap(dpi=DECK_SLIDE_RENDER_DPI).tobytes()
+                    # pil_tobytes (not tobytes(), which defaults to PNG)
+                    # guarantees real JPEG bytes matching the image/jpeg
+                    # media type llm.caption_image hardcodes, regardless of
+                    # render DPI — tobytes()'s PNG output would otherwise be
+                    # mislabeled below LLM_IMAGE_MAX_PX, where _downscale()
+                    # passes images through unmodified.
+                    image = page.get_pixmap(dpi=DECK_SLIDE_RENDER_DPI).pil_tobytes(format="JPEG")
                     caption = llm.caption_image(image, caption_cfg)
                     if caption.strip():
                         text = caption
