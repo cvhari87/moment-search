@@ -452,6 +452,37 @@ now returns only the 4 real videos, `/admin/sources` still returns all 6 rows. F
 rendering (proper icons/badges per source kind) is still Block F's job — this only stops
 documents from appearing somewhere they don't belong yet.
 
+## 2026-07-29 — UI feature: document upload (no local-testing path existed before this)
+
+Status: **complete**
+
+User asked to test paper/deck ingestion locally and pointed out there was no way to do it through
+the UI — only `POST /admin/documents` with a URL. Fair gap: videos have a full presign→upload
+flow with a file picker; documents never got the equivalent, because `eval.py` only ever registers
+by URL and never needed one. Added `POST /admin/documents/upload` (multipart file + kind + optional
+title) — no presign step, since a PDF capped at `DOCUMENT_FETCH_MAX_MB` is cheap enough to pass
+through the API process directly (presigning exists for videos because those are large enough that
+routing gigabytes through this process would be wasteful, not because a bypass is required in
+principle). The upload handler writes bytes to the same place the corpus deck already lives
+(`data/corpus/`, served by the existing `GET /corpus/{name}` route) for local dev, or to real
+object storage with a presigned GET URL when `storage.presign_capable()` — either way it hands off
+to the exact same uri-based registration path already built and reviewed in Block D, so the
+SSRF-hardened fetch logic in `src/ingest/document.py` is reused, not duplicated.
+
+Added a "Your documents" panel to the UI mirroring the video library's structure — file picker,
+paper/deck selector, title field, status list with retry/delete. Retry and delete reuse the
+existing `/api/videos/{id}/retry` and `DELETE /api/videos/{id}` endpoints for document rows too —
+both are kind-blind (operate on the shared `ms_videos` table regardless of `kind`), so this isn't a
+workaround, just not duplicating already-correct logic under a new path.
+
+One dependency gap caught immediately by a container crash on rebuild: FastAPI's `File`/`Form`
+support needs `python-multipart`, not installed. Added it to requirements.txt.
+
+Verified live end-to-end: uploaded the real deck PDF via curl, watched it reach `indexed` with the
+correct 7 chunks; confirmed auth is enforced (401 without a token), kind validation rejects
+`kind=video`, and content validation rejects a non-PDF file even with a `.pdf` extension. User then
+confirmed it works via the actual browser UI.
+
 ## Work to return to
 
 - [ ] **Block E:** deck slice by parameterization (slide locator + vision-caption branch for

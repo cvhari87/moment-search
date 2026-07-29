@@ -2,6 +2,7 @@
 fastapi>=0.110
 uvicorn[standard]>=0.27
 python-dotenv>=1.0
+python-multipart>=0.0.9  # required for FastAPI File()/Form() (document uploads)
 
 # Manifest (Neon Postgres) + work queue (Prefect Cloud)
 psycopg[binary,pool]>=3.1

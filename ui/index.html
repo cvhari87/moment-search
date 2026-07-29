@@ -105,6 +105,26 @@
     <p id="libNote" class="text-xs text-muted mt-3">YouTube is searched by picture (frames) and transcript; uploads by picture only for now. First ingest downloads the models.</p>
   </section>
 
+  <!-- DOCUMENTS (papers/decks) -->
+  <section id="docsSection" class="bg-card border border-line rounded-2xl p-5 mt-6">
+    <div class="flex items-center justify-between flex-wrap gap-3 mb-4">
+      <h2 class="display text-xl font-600">Your documents</h2>
+    </div>
+    <div class="flex gap-2 flex-wrap items-center">
+      <input id="docFile" type="file" accept="application/pdf,.pdf" class="flex-1 min-w-[180px] text-sm">
+      <select id="docKind" class="bg-white border border-line rounded-xl px-3 py-2.5 text-sm outline-none focus:border-coral">
+        <option value="paper">Paper</option>
+        <option value="deck">Deck</option>
+      </select>
+      <input id="docTitle" type="text" placeholder="Title (optional)"
+        class="min-w-[160px] bg-white border border-line rounded-xl px-4 py-2.5 text-sm outline-none focus:border-coral">
+      <button id="docBtn" class="bg-ink hover:bg-black text-white text-sm font-semibold rounded-xl px-5 py-2.5">Upload &amp; ingest</button>
+    </div>
+    <div id="docStatus" class="text-sm text-muted mt-3 min-h-[20px]"></div>
+    <div id="docs" class="flex flex-wrap gap-2 mt-2"></div>
+    <p class="text-xs text-muted mt-3">Papers are chunked by page, decks by slide, and searched alongside your videos. Uses the same admin token as above.</p>
+  </section>
+
   <!-- RESULTS -->
   <section id="resultsWrap" class="hidden mt-10">
     <article id="article" class="max-w-3xl"></article>
@@ -160,6 +180,7 @@ function applyMode(){
     $("#modeLink").textContent='← Back to the sample';     $("#modeLink").href='/';
     $("#libTitle").textContent='Your videos';
     $("#libNote").innerHTML='YouTube videos are searched by <b>both</b> what\'s shown (frames) and what\'s said (transcript). Uploaded files are searched by picture only for now — no transcript yet. Tip: unselect the samples to search only your own uploads.';
+    $("#docsSection").classList.remove("hidden");
   } else {
     $("#heroBadge").innerHTML='● Sample project · four LLM talks, pre-indexed';
     $("#heroTitle").innerHTML='A Deep Dive into <span class="text-coral">LLMs</span>.';
@@ -169,6 +190,7 @@ function applyMode(){
     $("#addTabs").classList.add("hidden");
     $("#addControls").classList.add("hidden");
     $("#libNote").textContent='A curated set of LLM explainers and talks, indexed by what appears on screen.';
+    $("#docsSection").classList.add("hidden");
   }
 }
 
@@ -355,6 +377,82 @@ $("#upBtn").onclick=async()=>{ const f=$("#upFile").files[0]; if(!f)return;
   }catch(e){ st.textContent="Error: "+e.message; $("#upBtn").disabled=false; }
 };
 
+/* ---------- documents (papers/decks) ---------- */
+/* Reuses /api/videos/{id}/retry and DELETE /api/videos/{id} for document
+   rows too — both handlers are kind-blind (operate on the shared ms_videos
+   table regardless of `kind`), so this isn't a hack, just not duplicating
+   already-correct logic under a new path. */
+const _DOC_INFLIGHT=["pending","queued","parsing","chunking","embedding"];
+let _docRefresher=null;
+function docBadge(d){
+  switch(d.status){
+    case "indexed":   return {icon:"✓", label:`${d.chunk_count||0} chunks`, c:"text-[#1f7a43]"};
+    case "pending":   return {icon:"◷", label:"waiting (fair queue)", c:"text-[#8a6d1a]"};
+    case "queued":    return {icon:"◷", label:"queued", c:"text-[#8a6d1a]"};
+    case "parsing":   return {icon:"⏬", label:"parsing…", c:"text-[#8a6d1a]"};
+    case "chunking":  return {icon:"⏳", label:"chunking…", c:"text-[#8a6d1a]"};
+    case "embedding": return {icon:"⏳", label:"embedding"+(d.pct!=null?` ${d.pct}%`:""), c:"text-[#8a6d1a]"};
+    case "failed":    return {icon:"⚠", label:"failed", c:"text-coral2"};
+    default:          return {icon:"•", label:d.status, c:"text-muted"};
+  }
+}
+async function loadDocs(){
+  const box=$("#docs"); if(!box) return [];
+  const r=await fetch("/admin/sources",{headers:authHeaders()});
+  if(!r.ok){ box.innerHTML='<span class="text-muted text-sm">Enter the admin token above to see documents.</span>'; return []; }
+  const {sources}=await r.json();
+  const docs=sources.filter(s=>s.kind!=="video");
+  box.innerHTML = docs.length ? docs.map(d=>{
+    const b=docBadge(d);
+    const retry=d.status==="failed"
+      ? `<button class="ml-2 text-muted hover:text-coral2" data-docretry="${esc(d.id)}" title="Retry ingest">↻</button>` : "";
+    const trash=`<button class="ml-2 text-muted hover:text-coral2" data-docdel="${esc(d.id)}" data-title="${esc(d.title||d.id)}" title="Delete permanently">🗑</button>`;
+    return `<span class="chip" style="cursor:default">${d.kind==="deck"?"📑":"📄"} ${esc(d.title||d.id)} <span class="${b.c}">· ${esc(b.label)}</span>${retry}${trash}</span>`;
+  }).join("") : '<span class="text-muted text-sm">No documents yet — upload one above.</span>';
+  box.querySelectorAll("[data-docretry]").forEach(btn=>btn.onclick=async()=>{
+    await fetch("/api/videos/"+encodeURIComponent(btn.dataset.docretry)+"/retry",{method:"POST",headers:authHeaders()});
+    loadDocs(); startDocRefresher();
+  });
+  box.querySelectorAll("[data-docdel]").forEach(btn=>btn.onclick=async()=>{
+    if(!confirm(`Delete “${btn.dataset.title}”?\n\nThis permanently removes its search vectors. This can’t be undone.`)) return;
+    const r=await fetch("/api/videos/"+encodeURIComponent(btn.dataset.docdel),{method:"DELETE",headers:authHeaders()});
+    if(!r.ok){ const e=await r.json().catch(()=>({})); alert(e.detail||"Delete failed."); return; }
+    loadDocs();
+  });
+  return docs;
+}
+function startDocRefresher(){
+  if(_docRefresher) return;
+  _docRefresher=setInterval(async()=>{
+    const docs=await loadDocs();
+    if(!docs || !docs.some(d=>_DOC_INFLIGHT.includes(d.status))){
+      clearInterval(_docRefresher); _docRefresher=null;
+      $("#docStatus").textContent="";
+    }
+  }, 2500);
+}
+if($("#docBtn")) $("#docBtn").onclick=async()=>{
+  const f=$("#docFile").files[0];
+  const st=$("#docStatus");
+  if(!f){ st.textContent="Choose a PDF first."; return; }
+  $("#docBtn").disabled=true;
+  st.textContent="Uploading…";
+  try{
+    const body=new FormData();
+    body.append("file", f);
+    body.append("kind", $("#docKind").value);
+    const title=$("#docTitle").value.trim();
+    if(title) body.append("title", title);
+    const r=await fetch("/admin/documents/upload",{method:"POST", headers:authHeaders(), body});
+    if(!r.ok){ const e=await r.json().catch(()=>({})); throw new Error(e.detail||r.statusText); }
+    await r.json();
+    st.textContent="Queued — processing in the background. Add another anytime.";
+    $("#docFile").value=""; $("#docTitle").value="";
+    loadDocs(); startDocRefresher();
+  }catch(e){ st.textContent="Error: "+e.message; }
+  finally{ $("#docBtn").disabled=false; }
+};
+
 /* ---------- ask ---------- */
 const qEl=$("#q");
 function autogrow(){ qEl.style.height="auto"; qEl.style.height=Math.min(qEl.scrollHeight,160)+"px"; }
@@ -458,6 +556,7 @@ $("#examples").innerHTML=EXAMPLES.map(q=>`<span class="chip">${esc(q)}</span>`).
 $("#examples").querySelectorAll(".chip").forEach(c=>c.onclick=()=>{ qEl.value=c.textContent; autogrow(); qEl.focus(); });
 
 applyMode(); loadConfig(); loadVideos();
+if(MODE==="full") loadDocs();
 </script>
 </body>
 </html>
