@@ -36,6 +36,19 @@ dist/
 # Internal design notes (not published)
 MULTIMODAL_RETRIEVAL.md
 
+# Local working plan for Assignment 3 — a scratch document, not a deliverable.
+# Ignored so it can't be committed by an unscoped `git add`.
+Assignment3_Plan.md
+Assignment3_Plan.docx
+
+# Generated evaluation output — regenerate with the eval script rather than
+# reading a committed copy, which goes stale the moment the stack changes.
+eval/REPORT.md
+
+# Agent tooling state: machine-local scheduler locks and personal subagent
+# definitions. The repo's shared agent docs live in AGENTS.md + docs/agents/.
+.claude/
+
 # OS / editor
 .DS_Store
 .idea/
