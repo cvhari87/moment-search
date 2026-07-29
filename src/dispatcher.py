@@ -49,12 +49,17 @@ def dispatch_once() -> int:
     for row in claimed:
         try:
             if row.get("kind", "video") == "video":
-                jobs.enqueue_video(row["id"], row["user_id"])
+                jobs.enqueue_video(row["id"], row["user_id"], row["generation"])
             else:
-                jobs.enqueue_document(row["id"], row["user_id"], row["kind"])
+                jobs.enqueue_document(row["id"], row["user_id"], row["kind"], row["generation"])
         except Exception as exc:
             # Couldn't reach Prefect — put it back so it's retried next tick.
-            db.set_status(row["id"], "pending", error=f"dispatch: {exc}")
+            # Gated by the generation wfq_claim just minted for this row, same
+            # as any other write: harmless either way since nothing else could
+            # have raced a newer admission in the few lines between claim and
+            # here, but keeps this call site consistent with every other
+            # in-flow write instead of being the one unguarded exception.
+            db.set_status(row["id"], "pending", error=f"dispatch: {exc}", generation=row["generation"])
     if claimed:
         print(f"[dispatch] admitted {len(claimed)} source(s) "
               f"({db.count_inflight()}/{config.DISPATCH_MAX_INFLIGHT} in flight)")

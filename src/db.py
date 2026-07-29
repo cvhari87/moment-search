@@ -77,6 +77,15 @@ ALTER TABLE ms_videos ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'video
 ALTER TABLE ms_videos ADD COLUMN IF NOT EXISTS uri TEXT;
 ALTER TABLE ms_videos ADD COLUMN IF NOT EXISTS chunk_count INT;
 CREATE INDEX IF NOT EXISTS ms_videos_kind_idx ON ms_videos (kind);
+
+-- Crash-safety reconciler (Block G): a lease token bumped on every admission
+-- (wfq_claim). Every status/progress/attempts write a flow makes carries the
+-- generation it was admitted under, gated by this column — so if the
+-- reconciler resets a row to 'pending' while an old, still-alive run is mid-
+-- write, and a new run gets admitted (bumping generation again) before the
+-- old one finishes, the old run's writes silently no-op instead of clobbering
+-- the new run's progress. See db.set_status's docstring.
+ALTER TABLE ms_videos ADD COLUMN IF NOT EXISTS generation INT NOT NULL DEFAULT 0;
 """
 
 # Advisory-lock key for schema init. Arbitrary but stable — must not collide
@@ -150,8 +159,17 @@ def upsert_pending(video: dict[str, Any]) -> dict:
 def set_status(video_id: str, status: str, *, error: str | None = None,
                title: str | None = None, frame_count: int | None = None,
                source_hash: str | None = None, embed_version: str | None = None,
-               progress: float | None = None, chunk_count: int | None = None) -> None:
-    """Narrow stale-write guard, not a full fencing mechanism: once a row is
+               progress: float | None = None, chunk_count: int | None = None,
+               generation: int | None = None) -> None:
+    """`generation`, when passed, is the lease token (see SCHEMA's comment on
+    the column) a flow run was admitted under — the write becomes a no-op if
+    the row's generation has since moved on (a reconciler resume + a fresh
+    admission happened while this run was still alive). Callers outside a
+    flow (the reconciler's own sweep, the /retry endpoint, upsert_pending)
+    intentionally omit it: those ARE the events that legitimately change
+    admission state, not writers racing to be the last one in.
+
+    Narrow stale-write guard, not a full fencing mechanism on its own: once a row is
     'indexed', NO further write from this function applies to it UNLESS the
     new status is 'pending' (the one legitimate way anything un-terminals an
     indexed row: a fresh, deliberate re-registration through
@@ -185,34 +203,92 @@ def set_status(video_id: str, status: str, *, error: str | None = None,
                 updated_at = now()
             WHERE id = %(video_id)s
               AND (status != 'indexed' OR %(status)s = 'pending')
+              AND (%(generation)s::int IS NULL OR generation = %(generation)s::int)
             """,
             {"status": status, "error": error, "title": title, "frame_count": frame_count,
              "source_hash": source_hash, "embed_version": embed_version, "progress": progress,
-             "chunk_count": chunk_count, "video_id": video_id},
+             "chunk_count": chunk_count, "video_id": video_id, "generation": generation},
         )
 
 
-def set_progress(video_id: str, progress: float) -> None:
+def set_progress(video_id: str, progress: float, *, generation: int | None = None) -> None:
     """Same 'indexed' guard as set_status() — a stale run's own progress
     callbacks (video sampling/embedding report progress many times per run)
     shouldn't cosmetically overwrite an already-indexed row's progress
     either, even though a stray progress value is lower-severity than a
-    stray status."""
+    stray status. Same `generation` lease-token gate as set_status()."""
     with pool().connection() as conn:
         conn.execute(
-            "UPDATE ms_videos SET progress = %s, updated_at = now() "
-            "WHERE id = %s AND status != 'indexed'",
-            (round(progress, 3), video_id),
+            "UPDATE ms_videos SET progress = %(progress)s, updated_at = now() "
+            "WHERE id = %(video_id)s AND status != 'indexed' "
+            "AND (%(generation)s::int IS NULL OR generation = %(generation)s::int)",
+            {"progress": round(progress, 3), "video_id": video_id, "generation": generation},
         )
 
 
-def bump_attempts(video_id: str) -> int:
+class StaleLeaseError(RuntimeError):
+    """Raised when a flow discovers — at flow start (bump_attempts) or mid-
+    run (check_generation) — that its `generation` lease has been superseded
+    by a newer admission (the reconciler swept this row as stale while THIS
+    run was still alive, and the dispatcher has since re-admitted it under a
+    new generation). This is not an ingest failure: a newer run already owns
+    the row and is the one that should finish it. The caller must stop
+    immediately, before doing any further destructive/overwriting work
+    (deleting or overwriting frames, Qdrant points, or checkpoints) — set_status()'s
+    generation guard alone only protects the STATUS COLUMN, it does nothing
+    to stop the stale run's actual side effects from clobbering the newer
+    run's in-progress state in the meantime. See check_generation()."""
+
+
+def check_generation(video_id: str, generation: int) -> None:
+    """Revalidate a lease mid-task, immediately before a destructive or
+    overwriting side effect (deleting existing frames/Qdrant points,
+    overwriting a checkpoint, upserting chunks). A stale run can otherwise
+    run for minutes past the point its lease was superseded — set_status()'s
+    guard silently no-ops its STATUS writes the whole time, but nothing stops
+    it from continuing to execute and corrupt shared state UNLESS every
+    destructive stage explicitly checks first. Raises StaleLeaseError if the
+    row's current generation no longer matches; a no-op if it still does."""
     with pool().connection() as conn:
         row = conn.execute(
-            "UPDATE ms_videos SET attempts = attempts + 1, updated_at = now() WHERE id = %s RETURNING attempts",
-            (video_id,),
+            "SELECT generation FROM ms_videos WHERE id = %s", (video_id,)
         ).fetchone()
-    return row["attempts"] if row else 0
+    current = row["generation"] if row else None
+    if current != generation:
+        raise StaleLeaseError(
+            f"{video_id}: lease generation {generation} superseded "
+            f"(current={current!r}) — aborting before further side effects")
+
+
+def bump_attempts(video_id: str, *, generation: int | None = None) -> int:
+    """Same `generation` gate as set_status(). Unlike set_status() — where a
+    rejected write silently no-ops because a stray status/progress value is
+    low-severity — a rejected bump here means this run's lease was ALREADY
+    gone before it did any work, so it raises StaleLeaseError instead of
+    quietly returning a number: this is the flow-start check that stops a
+    stale run before t_fetch/t_parse even begins. Raises ValueError if the
+    row is simply gone (deleted mid-run) — a different, real error, not a
+    lease loss."""
+    with pool().connection() as conn:
+        row = conn.execute(
+            "UPDATE ms_videos SET attempts = attempts + 1, updated_at = now() "
+            "WHERE id = %(video_id)s "
+            "AND (%(generation)s::int IS NULL OR generation = %(generation)s::int) "
+            "RETURNING attempts",
+            {"video_id": video_id, "generation": generation},
+        ).fetchone()
+        if row:
+            return row["attempts"]
+        current = conn.execute(
+            "SELECT attempts, generation FROM ms_videos WHERE id = %s", (video_id,)
+        ).fetchone()
+    if current is None:
+        raise ValueError(f"no manifest row for {video_id}")
+    if generation is not None and current["generation"] != generation:
+        raise StaleLeaseError(
+            f"{video_id}: lease generation {generation} superseded "
+            f"(current={current['generation']!r}) — aborting before any work")
+    return current["attempts"]
 
 
 def get_video(video_id: str) -> dict | None:
@@ -318,11 +394,56 @@ def wfq_claim(limit: int, *, fair: bool = True) -> list[dict]:
             return []
         return conn.execute(
             """
-            UPDATE ms_videos SET status = 'queued', updated_at = now()
+            UPDATE ms_videos SET status = 'queued', generation = generation + 1, updated_at = now()
             WHERE id = ANY(%s) AND status = 'pending'
-            RETURNING id, user_id, kind
+            RETURNING id, user_id, kind, generation
             """,
             (ids,),
+        ).fetchall()
+
+
+# ── Crash safety / reconciler (Block G) ──────────────────────────────────────
+
+def reconcile_stale(stale_seconds: float, max_attempts: int) -> list[dict]:
+    """Atomically find sources stuck in an in-flight status (queued,
+    fetching/sampling, parsing/chunking, embedding) whose updated_at hasn't
+    moved in `stale_seconds`, and either reset them to 'pending' (dispatcher
+    fairly re-admits, resumes from checkpoint) or, if they've already burned
+    through `max_attempts` flow-run attempts, dead-letter them straight to
+    'failed' instead of resurrecting a source that just keeps crashing the
+    worker. One UPDATE ... RETURNING, no separate SELECT-then-UPDATE — avoids
+    a TOCTOU race against a run that finishes (reaches 'indexed') in the gap
+    between reading and writing.
+
+    Bumps `generation` in this SAME atomic write — load-bearing, not
+    optional. Without it, a row reset to 'pending' keeps the OLD run's
+    generation until the dispatcher happens to claim it (wfq_claim() is the
+    only other generation-bumping site), which can be seconds away. In that
+    window, an old run that's actually still alive (a false-positive
+    staleness read, not a real crash) still holds a lease that matches —
+    check_generation()/set_status() would let it keep writing, potentially
+    racing the dispatcher's next admission or, worse, undoing a dead-letter
+    this same call just wrote (status='failed' isn't otherwise generation-
+    protected the way 'indexed' is). Bumping here closes that at the
+    source: by the time this UPDATE commits, ANY generation an old run is
+    still holding is already stale, regardless of whether or when the
+    dispatcher re-admits the row."""
+    with pool().connection() as conn:
+        return conn.execute(
+            """
+            UPDATE ms_videos SET
+                status = CASE WHEN attempts >= %(max_attempts)s THEN 'failed' ELSE 'pending' END,
+                error = CASE WHEN attempts >= %(max_attempts)s
+                             THEN 'reconciler: exceeded max ingest attempts after repeated staleness resets'
+                             ELSE error END,
+                generation = generation + 1,
+                updated_at = now()
+            WHERE status = ANY(%(inflight)s)
+              AND updated_at < now() - (%(stale_seconds)s * interval '1 second')
+            RETURNING id, status, kind, attempts, generation
+            """,
+            {"max_attempts": max_attempts, "inflight": list(INFLIGHT_STATUSES),
+             "stale_seconds": stale_seconds},
         ).fetchall()
 
 

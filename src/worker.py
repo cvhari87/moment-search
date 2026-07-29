@@ -35,6 +35,10 @@ def main():
     # enqueues directly.
     from . import dispatcher
     dispatcher.start_in_background()
+    # Staleness sweep (Block G): recovers sources orphaned by a hard-killed
+    # worker process, which Prefect's own task retries never see happen.
+    from . import reconciler
+    reconciler.start_in_background()
     limit = int(os.getenv("WORKER_CONCURRENCY", "2"))
     # serve() talks to Prefect Cloud on startup; a transient outage (e.g. a 503)
     # used to crash the worker permanently and stop the machine. Self-heal:

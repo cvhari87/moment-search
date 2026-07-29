@@ -62,6 +62,20 @@ from ..rag.embeddings import embed_docs
 
 _MAX_BYTES = DOCUMENT_FETCH_MAX_MB * 1024 * 1024
 
+
+class PermanentDocumentError(ValueError):
+    """A fetch/validation failure that is deterministic given the same
+    input — retrying it changes nothing. Raised by _validate_host and
+    _fetch_bytes for an unresolvable/blocked host, a disallowed redirect, an
+    oversized body, or content that isn't actually a PDF. t_parse's
+    retry_condition_fn (below _fetch_bytes) uses this to skip its normal
+    retry budget for these specifically — the alternative (retrying a
+    permanently-broken URI twice, 30s then 120s later) is exactly what let
+    benchmark/bench.py's 30 example.com probes hold dispatcher slots for
+    tens of minutes instead of failing fast. Genuine transient failures
+    (connection refused, timeout, DNS hiccup) raise their normal builtin
+    exception types instead and keep the full retry budget."""
+
 # Paper and deck are one parameterized code path (parse -> chunk -> embed),
 # not two modules. This is the one thing that actually differs: the name of
 # the locator field a chunk's payload carries downstream — a page number for
@@ -130,13 +144,13 @@ def _validate_host(host: str, port: int) -> str:
     try:
         infos = socket.getaddrinfo(host, None)
     except socket.gaierror as exc:
-        raise ValueError(f"cannot resolve host {host!r}: {exc}") from exc
+        raise PermanentDocumentError(f"cannot resolve host {host!r}: {exc}") from exc
     if f"{host.lower()}:{port}" in DOCUMENT_FETCH_ALLOWED_INTERNAL_HOSTS:
         return infos[0][4][0]
     for *_rest, sockaddr in infos:
         ip = ipaddress.ip_address(sockaddr[0])
         if _is_blocked_ip(ip):
-            raise ValueError(
+            raise PermanentDocumentError(
                 f"refusing to fetch {host!r}:{port} -> {ip} (not a public address, and "
                 f"{host!r}:{port} is not in DOCUMENT_FETCH_ALLOWED_INTERNAL_HOSTS)")
     return infos[0][4][0]
@@ -178,7 +192,7 @@ def _fetch_bytes(uri: str) -> bytes:
     parsed = urllib.parse.urlparse(uri)
     host = parsed.hostname
     if not host:
-        raise ValueError(f"uri has no hostname: {uri!r}")
+        raise PermanentDocumentError(f"uri has no hostname: {uri!r}")
     port = parsed.port or (443 if parsed.scheme == "https" else 80)
     ip = _validate_host(host, port)
     path = parsed.path or "/"
@@ -194,17 +208,24 @@ def _fetch_bytes(uri: str) -> bytes:
         conn.endheaders()
         resp = conn.getresponse()
         if 300 <= resp.status < 400:
-            raise ValueError(f"refusing to follow redirect (HTTP {resp.status})")
+            raise PermanentDocumentError(f"refusing to follow redirect (HTTP {resp.status})")
+        if resp.status >= 500 or resp.status == 429:
+            # Server error or rate-limit: plausibly transient on an otherwise
+            # legitimate host (429 especially — retrying WITH backoff, which
+            # t_parse's retry_delay_seconds already provides, is the normal,
+            # correct response, not a reason to fail fast). Unlike every
+            # other case here, keep the normal task retry budget.
+            raise RuntimeError(f"fetch failed: HTTP {resp.status} {resp.reason} (retryable)")
         if resp.status != 200:
-            raise ValueError(f"fetch failed: HTTP {resp.status} {resp.reason}")
+            raise PermanentDocumentError(f"fetch failed: HTTP {resp.status} {resp.reason}")
         data = resp.read(_MAX_BYTES + 1)
     finally:
         conn.close()
 
     if len(data) > _MAX_BYTES:
-        raise ValueError(f"document exceeds {DOCUMENT_FETCH_MAX_MB}MB fetch limit")
+        raise PermanentDocumentError(f"document exceeds {DOCUMENT_FETCH_MAX_MB}MB fetch limit")
     if not data.startswith(b"%PDF"):
-        raise ValueError("fetched content is not a PDF (missing %PDF magic bytes)")
+        raise PermanentDocumentError("fetched content is not a PDF (missing %PDF magic bytes)")
     return data
 
 
@@ -350,8 +371,21 @@ def _load_checkpoint(key: str, validate) -> list[dict] | None:
     return data
 
 
-@task(name="parse-document", retries=2, retry_delay_seconds=[30, 120])
-def t_parse(doc_id: str, user_id: str, uri: str | None, kind: str,
+def _skip_retry_on_permanent_error(task, task_run, state) -> bool:
+    """t_parse's retry_condition_fn: False (don't retry) when the task
+    failed with a PermanentDocumentError — deterministic given the same
+    input, so Prefect's retry budget (30s then 120s) would just hold a
+    dispatcher slot for tens of minutes across a batch of poison URIs for no
+    benefit. True (use the normal retries=2 budget) for anything else — a
+    real transient network/connection error, or an unexpected bug, both of
+    which a retry might plausibly help with. `state.data` holds the raised
+    exception (see prefect.task_engine.SyncTaskRunEngine.can_retry)."""
+    return not isinstance(state.data, PermanentDocumentError)
+
+
+@task(name="parse-document", retries=2, retry_delay_seconds=[30, 120],
+     retry_condition_fn=_skip_retry_on_permanent_error)
+def t_parse(doc_id: str, user_id: str, uri: str | None, kind: str, generation: int,
            storage_key: str | None = None) -> list[dict]:
     """Get the raw PDF bytes one of two ways: `storage_key` (an upload
     already sitting in OUR storage — read directly, no fetch, no expiry,
@@ -359,23 +393,37 @@ def t_parse(doc_id: str, user_id: str, uri: str | None, kind: str,
     (an external https:// document — SSRF-hardened HTTP fetch, since we
     don't already have those bytes ourselves). Exactly one is set per row
     (src/api/documents.py's _register)."""
-    db.set_status(doc_id, "parsing")
+    db.set_status(doc_id, "parsing", generation=generation)
     key = _parsed_key(user_id, doc_id, kind)
     cached = _load_checkpoint(key, _valid_parsed_pages)
     if cached is not None:
         print(f"[parse] {doc_id}: parsed.json already committed — resuming from checkpoint")
         return cached
     data = storage.get_bytes(storage_key) if storage_key else _fetch_bytes(uri)
-    pages = _parse_pdf(data, kind, user_id)
+    try:
+        pages = _parse_pdf(data, kind, user_id)
+    except Exception as exc:
+        # A file that starts with %PDF but is corrupt/malformed past that
+        # point fails deterministically on every retry — same bytes, same
+        # parser, same outcome. fitz's own exception types vary (FileDataError
+        # and others), so this catches broadly rather than trying to enumerate
+        # them; anything from _parse_pdf given fixed input bytes is permanent.
+        raise PermanentDocumentError(
+            f"failed to parse PDF: {type(exc).__name__}: {exc}") from exc
     if not any(p["text"].strip() for p in pages):
-        raise RuntimeError("No extractable text in document.")
+        raise PermanentDocumentError("No extractable text in document.")
+    # Revalidate before committing the checkpoint: a stale run's fetch+parse
+    # above was wasted work if its lease is already gone, but writing this
+    # artifact would still be a real corruption risk if a newer run had
+    # already committed a different (or fresher) parsed.json for this key.
+    db.check_generation(doc_id, generation)
     storage.put_bytes(key, json.dumps(pages).encode(), "application/json")
     return pages
 
 
 @task(name="chunk-document")
-def t_chunk(doc_id: str, user_id: str, pages: list[dict], kind: str) -> list[dict]:
-    db.set_status(doc_id, "chunking")
+def t_chunk(doc_id: str, user_id: str, pages: list[dict], kind: str, generation: int) -> list[dict]:
+    db.set_status(doc_id, "chunking", generation=generation)
     key = _chunks_key(user_id, doc_id, kind)
     cached = _load_checkpoint(key, lambda d: _valid_chunks(d, max_len=DOCUMENT_MAX_CHUNKS))
     if cached is not None:
@@ -385,53 +433,72 @@ def t_chunk(doc_id: str, user_id: str, pages: list[dict], kind: str) -> list[dic
     for p in pages:
         chunks.extend(_chunk_page(p["text"], p["page"], DOCUMENT_CHUNK_CHARS))
         if len(chunks) > DOCUMENT_MAX_CHUNKS:
-            raise RuntimeError(f"Document exceeds {DOCUMENT_MAX_CHUNKS} chunks "
-                               f"(byte cap alone doesn't bound page/text count).")
+            # Deterministic given the same parsed pages — t_chunk currently
+            # has no retries configured (so this doesn't retry today either
+            # way), but typed correctly in case that ever changes.
+            raise PermanentDocumentError(
+                f"Document exceeds {DOCUMENT_MAX_CHUNKS} chunks "
+                f"(byte cap alone doesn't bound page/text count).")
     if not chunks:
-        raise RuntimeError("Chunking produced zero chunks.")
+        raise PermanentDocumentError("Chunking produced zero chunks.")
+    db.check_generation(doc_id, generation)  # see t_parse's identical check above
     storage.put_bytes(key, json.dumps(chunks).encode(), "application/json")
     return chunks
 
 
 @task(name="embed-index-document", retries=2, retry_delay_seconds=60)
-def t_embed(doc_id: str, user_id: str, chunks: list[dict], kind: str, uri: str) -> int:
+def t_embed(doc_id: str, user_id: str, chunks: list[dict], kind: str, uri: str, generation: int) -> int:
     # Defense in depth: t_chunk's own validation should make this unreachable
     # (empty/wrong-shaped chunk lists are now rejected before they get here),
     # but never let a source reach 'indexed' with nothing actually indexed.
     if not chunks:
         raise RuntimeError("t_embed received zero chunks — refusing to mark indexed.")
-    db.set_status(doc_id, "embedding", progress=0.0)
+    db.set_status(doc_id, "embedding", progress=0.0, generation=generation)
     vector_store.ensure_text_collection()
     vecs = embed_docs([c["text"] for c in chunks])
     if len(vecs) != len(chunks):
         raise RuntimeError(f"embed_docs returned {len(vecs)} vectors for {len(chunks)} chunks "
                            f"— refusing to upsert a mismatched batch.")
     locator_key = KIND_SPEC.get(kind, "page")
+    # Revalidate before the Qdrant write — the most consequential of the
+    # three checks, since a stale run upserting stale/wrong text here would
+    # silently corrupt a newer run's freshly-indexed content (deterministic
+    # point IDs make this an overwrite, not a duplicate, which is exactly
+    # why it's dangerous rather than merely wasteful).
+    db.check_generation(doc_id, generation)
     vector_store.upsert_chunks(user_id, doc_id, vecs, payloads=[
         {"user_id": user_id, "video_id": doc_id, "source_id": doc_id, "kind": kind,
          locator_key: c["page"], "uri": uri, "text": c["text"], "modality": "text",
          "embed_version": TEXT_EMBED_VERSION}
         for c in chunks
     ])
-    db.set_status(doc_id, "indexed", chunk_count=len(chunks), progress=1.0)
+    db.set_status(doc_id, "indexed", chunk_count=len(chunks), progress=1.0, generation=generation)
     return len(chunks)
 
 
 @flow(name="ms-ingest-document", log_prints=True, timeout_seconds=1800)
-def ingest_document(doc_id: str, user_id: str, kind: str) -> dict:
-    attempt = db.bump_attempts(doc_id)
+def ingest_document(doc_id: str, user_id: str, kind: str, generation: int) -> dict:
+    """`generation` is the lease token db.wfq_claim() minted when this run was
+    admitted — see ingest_video's docstring (src/ingest/pipeline.py) for the
+    full mechanism; identical here."""
     try:
+        attempt = db.bump_attempts(doc_id, generation=generation)
         row = db.get_video(doc_id)
         if row is None:
             raise ValueError(f"no manifest row for {doc_id}")
         uri, storage_key = row["uri"], row.get("storage_key")
         if not uri and not storage_key:
             raise ValueError(f"{doc_id} has no uri or storage_key")
-        pages = t_parse(doc_id, user_id, uri, kind, storage_key)
-        chunks = t_chunk(doc_id, user_id, pages, kind)
-        n = t_embed(doc_id, user_id, chunks, kind, uri)
+        pages = t_parse(doc_id, user_id, uri, kind, generation, storage_key)
+        chunks = t_chunk(doc_id, user_id, pages, kind, generation)
+        n = t_embed(doc_id, user_id, chunks, kind, uri, generation)
         print(f"[ingest] {doc_id} indexed: {n} chunks (attempt {attempt})")
         return {"doc_id": doc_id, "chunks": n}
+    except db.StaleLeaseError as exc:
+        # A newer run already owns this row — not an ingest failure. See
+        # ingest_video's identical handling (src/ingest/pipeline.py).
+        print(f"[ingest] {doc_id}: {exc}")
+        return {"doc_id": doc_id, "stale_lease": True}
     except Exception as exc:
-        db.set_status(doc_id, "failed", error=f"{type(exc).__name__}: {exc}")
+        db.set_status(doc_id, "failed", error=f"{type(exc).__name__}: {exc}", generation=generation)
         raise  # Prefect marks the run Failed; full trace in the Cloud UI

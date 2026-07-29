@@ -126,6 +126,30 @@ ENABLE_FAIR_DISPATCH = _envbool("ENABLE_FAIR_DISPATCH", True)
 DISPATCH_MAX_INFLIGHT = _int("DISPATCH_MAX_INFLIGHT", _int("WORKER_CONCURRENCY", 2))
 DISPATCH_INTERVAL_S = _float("DISPATCH_INTERVAL_S", 3.0)  # how often the dispatcher tops up
 
+# --- Crash safety / reconciler (Block G) ---------------------------------------
+# Prefect's @task(retries=N) only catches an in-process exception — a hard-killed
+# worker (docker kill, OOM, host crash) leaves a row stuck in an in-flight status
+# forever, since nothing inside the dead process can run to fix it. The
+# reconciler (src/reconciler.py) sweeps for exactly that, on a timer.
+#
+# RECONCILE_STALE_S must sit comfortably above the longest in-task retry backoff
+# any single stage can already go through on its own — t_parse's retries=2,
+# retry_delay_seconds=[30, 120] (~150s worst case) and t_embed's retries=2,
+# retry_delay_seconds=60 (~120s) — otherwise the sweep could "rescue" a row
+# that's actually still alive, just mid-retry inside a live task, and admit a
+# second concurrent run for it. (db.set_status's `generation` guard is what
+# makes that race harmless even so — see db.py — since no fixed threshold is
+# airtight against an arbitrarily slow but genuinely-alive task.)
+RECONCILE_STALE_S = _float("RECONCILE_STALE_S", 300.0)
+RECONCILE_INTERVAL_S = _float("RECONCILE_INTERVAL_S", 20.0)
+# Total flow-run attempts (across resumes, not just in-task retries) before a
+# repeatedly-crashing source is dead-lettered (marked 'failed') by the sweep
+# instead of resurrected again — the poison-URI DLQ backstop for a source that
+# crashes the worker process itself, not just one that cleanly raises (a clean
+# raise already terminates in 'failed' within its own flow run — see
+# src/ingest/document.py's _fetch_bytes / except Exception block).
+MAX_INGEST_ATTEMPTS = _int("MAX_INGEST_ATTEMPTS", 5)
+
 # --- Frame sampling (the biggest scaling lever) --------------------------------
 # interval: one frame every FRAME_INTERVAL_SEC (widened to respect MAX_FRAMES).
 # scene:    one frame per detected cut (ffmpeg scene filter).
