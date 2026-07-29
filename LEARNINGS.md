@@ -596,8 +596,14 @@ The final resilience requirement is stronger. It must demonstrate that:
 - committed stages are not repeated; and
 - redelivery does not duplicate indexed data.
 
-The current `benchmark/bench.py --resilience` path is still a stub, so the experiment must not be
-reported as the final resilience gate passing.
+Block H replaced the original `benchmark/bench.py --resilience` stub with a real worker-kill
+workflow. Independent review then found an equally important second lesson: replacing a stub with
+executable code does not automatically make the result trustworthy. The first implementation
+could report success even when no tracked source was active and both Docker commands failed,
+because it checked only whether the documents were `indexed` at the end. The resilience gate must
+therefore prove its preconditions and intervention as well as its final state: work was genuinely
+in flight, the worker was actually killed, it was successfully restarted, abandoned work was
+readmitted, and an already-committed stage was reused rather than repeated.
 
 The difference is similar to dropping one package to see what the courier does versus running a
 formal delivery audit that proves every package arrived, no package was duplicated, and completed
@@ -870,3 +876,143 @@ this required literally replaying the multi-step sequence (`indexed`, then `pars
 `embedding`, then `failed`, as separate calls) rather than testing the single transition that had
 been fixed — because a fix that's tested only against the exact reproduction that motivated it will
 reliably pass that one test while leaving the general case, which produced it, still open.
+
+## A benchmark is production code for claims
+
+Block H made the benchmark executable, but the guardrail review showed that measurement code needs
+the same adversarial testing as application code. A benchmark is not just a stopwatch wrapped
+around the product. It is a small program that selects a cohort, establishes preconditions,
+performs an intervention, observes results, handles failures, and decides pass or fail. A defect in
+any of those steps can make a broken system look healthy.
+
+The most useful test for a benchmark is often not the happy path. It is to deliberately replace
+its dependencies with bad outcomes and ask whether it still turns green. For example, the first
+Block H resilience implementation was tested with documents that were already indexed and mocked
+Docker commands that both returned failure. It still returned `no_loss=True`. That reproduction
+was valuable because it proved the problem was in the benchmark's decision logic, independent of
+Docker, Prefect, Postgres, or timing noise.
+
+In plain English: a smoke alarm is not trustworthy merely because it makes a noise when its test
+button is pressed. We also need to know it does not announce “all clear” when its sensor is
+disconnected. Benchmarks need tests for false passes, not only demonstrations that they can pass.
+
+## A decoupling benchmark must prove that the two workloads actually overlapped
+
+The purpose of the decoupling ratio is to answer a specific question: does search remain fast
+*while ingestion is actively consuming resources*? Measuring search before a backfill and again
+after the backfill has already drained does not answer that question, even if the script labels the
+second number “during.”
+
+The first Block H implementation improved on the original idle-versus-idle stub by launching a real
+backfill. However, if that backfill finished before all search samples were collected, the script
+only printed a warning and still allowed the ratio to pass. It also treated `pending` rows as
+evidence of overlap. A pending row is merely waiting in line; it does not prove a worker is parsing,
+chunking, embedding, or writing to Qdrant.
+
+A trustworthy measurement makes overlap a validity condition, not an informational message. It
+should observe active worker-owned statuses throughout a meaningful portion of the sampling window
+and invalidate the result if that condition is not met. The workload should be sized dynamically
+from a pilot measurement or extended until it comfortably outlasts the search sample. Otherwise a
+fast-draining workload can make the system appear isolated simply because there was little or no
+contention to observe.
+
+Layman analogy: measuring traffic before roadworks begin and after the crew has packed up cannot
+tell us whether the road stayed usable during construction. Seeing unopened work orders in the
+office does not prove construction was happening either; we need to observe crews actively working
+while traffic is measured.
+
+### A required benchmark threshold must not be lowerable from the command line
+
+The hardened Block H benchmark defined sufficient overlap as at least half of its observations
+finding real ingest work active. That is what `min_overlap_frac=0.5` means: if the benchmark polls
+the system 20 times while measuring search, at least 10 polls must see a document actively being
+parsed, chunked, or embedded. This does not say that half the documents must be running; it says
+that ingestion must genuinely overlap at least half of the measurement window.
+
+The first version exposed that value through `--min-overlap-frac`. This looked like a useful tuning
+option, but it also allowed a command such as `--min-overlap-frac 0`. With a required fraction of
+zero, even 0 active observations out of 20 satisfies the mathematical comparison (`0 >= 0`). The
+script could then report a passing decoupling result without observing ingestion and search running
+together at all — recreating the exact false pass the overlap check was introduced to prevent.
+
+This is different from choosing a larger benchmark workload or raising the threshold for a stricter
+test. A user may safely make a gate harder, but a required grading invariant must have a fixed floor
+that cannot be weakened by ordinary runtime configuration. The safe designs are therefore either:
+
+- remove the command-line option and keep the required `0.5` value inside the benchmark; or
+- retain the option for stricter experiments, but reject every value below `0.5` (and values above
+  `1.0`) during argument validation.
+
+In plain English: if an exam requires 50% to pass, a command-line switch must not let the person
+taking it redefine passing as 0%. Configuration is useful for changing the size of the experiment;
+it must not be a back door for changing what success means.
+
+## Isolation means shared capacity is quiet, not merely that IDs are separate
+
+Giving every benchmark phase its own user and tracking only the IDs that phase created is good
+cohort isolation. It prevents a resilience check from mistaking another user's failed document for
+one of its own. But separate identifiers do not create separate CPUs, worker slots, database
+connections, or dispatcher capacity.
+
+This mattered for the 30 deliberately broken `example.com/probe_N.pdf` acceptance probes. Block H
+gave them a separate benchmark user, which fixed per-user FIFO starvation, but it immediately began
+the “idle” search baseline without waiting for those probes to reach `failed`. The probes could
+still occupy the globally shared ingest capacity. That makes the supposedly idle baseline busy and
+can also steal capacity from the throughput backfill that follows.
+
+Each benchmark phase must therefore leave the shared system in a known state before the next phase
+starts. For the poison probes, that means waiting for the exact accepted ID set and requiring every
+one to reach the expected terminal state, `failed`, before measuring idle search. Namespace
+isolation answers “whose rows are these?”; quiescence answers “what else is using the machine?” We
+need both.
+
+## Failed measurements belong in the denominator
+
+Latency calculated only from successful requests can look excellent while the service is mostly
+broken. The first Block H implementation discarded non-202 registrations and removed failed or
+timed-out search requests before calculating p95. In the extreme case reproduced during review,
+one successful 10 ms search plus 39 failed searches became a reported 10 ms p95. The fast number
+was mathematically correct for the one retained sample and operationally meaningless for the test
+that was attempted.
+
+The same rule applies to throughput. If 20 documents are requested but only five register, counting
+the five successful documents can produce an attractive chunks-per-second number while silently
+shrinking the workload. A benchmark must retain the attempted cohort, require the expected sample
+count, report missing/failed outcomes, and gate the error percentage against
+`error_rate_max_pct`. Throughput should not pass unless all guaranteed-valid benchmark documents
+reach the expected successful terminal state.
+
+This is a general observability lesson: removing errors from a dataset does not remove failure from
+the system. It only removes evidence of failure from the report.
+
+## A resilience result needs four kinds of evidence
+
+A final `indexed` status is necessary but insufficient proof of crash recovery. A rigorous
+resilience check establishes four separate facts:
+
+1. **Precondition:** at least one tracked source was actively executing when the experiment began.
+2. **Intervention:** the intended worker process was successfully killed, and its replacement was
+   successfully started.
+3. **Outcome:** every accepted, valid source eventually reached `indexed`; none was failed, stuck,
+   duplicated, or dropped.
+4. **Resume behavior:** logs or checkpoint state show that a stage committed before the crash was
+   reused instead of rerun.
+
+Checking only the fourth-stage destination (“all rows are indexed now”) cannot distinguish recovery
+from a no-op experiment where everything completed before the kill, the kill command failed, or a
+new run repeated all work from the beginning. The benchmark should fail closed when it cannot prove
+one of these facts. In other words, “nothing was lost” is meaningful only after proving that
+something was genuinely interrupted.
+
+## Metric names are contracts: recall@10 requires ten observable results
+
+The first recall implementation examined `citations[:10]`, but `/ask_stream` returned the
+application's configured default of six citations (`TOP_K=6`). Taking the first ten items from a
+six-item response does not turn it into recall@10. In this case the mistake was conservative—it
+could create a false failure, not inflate recall—but the reported metric still did not match its
+name or the SLA.
+
+The requested retrieval depth must be explicit at the API boundary used by the benchmark. If the
+metric is recall@10, the system must expose ten ranked candidates for that measurement, and the
+benchmark must score those ten. A label is not a transformation; calling a six-result measurement
+“@10” does not change what was observed.

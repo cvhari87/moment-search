@@ -175,7 +175,7 @@ def _sse(data: dict) -> str:
 
 
 @router.get("/ask_stream")
-def ask_stream(q: str, x_user_id: str | None = Header(default=None)):
+def ask_stream(q: str, top_k: int | None = None, x_user_id: str | None = Header(default=None)):
     """Assignment-contract SSE endpoint: citations event first (so a client
     is grounded before the slow part even starts), then the answer — kept
     entirely separate from POST /api/ask, which is untouched.
@@ -183,7 +183,13 @@ def ask_stream(q: str, x_user_id: str | None = Header(default=None)):
     retrieve() (fast: two vector searches + fusion) and answer_from_citations()
     (slow: the LLM call) are called as two separate steps, not via ask(), so
     the citations SSE chunk is flushed to the client before the LLM call even
-    begins, not just before its result happens to be serialized."""
+    begins, not just before its result happens to be serialized.
+
+    `top_k` is optional and defaults to None (config.TOP_K, currently 6) —
+    added so benchmark/bench.py's recall check can literally request 10
+    results for a "recall@10" measurement instead of silently testing
+    whatever the app's own default happens to be. eval.py and every other
+    existing caller omit it and see identical behavior to before."""
     uid = _uid(x_user_id)
     question = q.strip()
 
@@ -191,7 +197,7 @@ def ask_stream(q: str, x_user_id: str | None = Header(default=None)):
         if not question:
             yield _sse({"citations": []})
             return
-        r = rag_search.retrieve(question, uid)
+        r = rag_search.retrieve(question, uid, top_k=top_k)
         # Gate 1 FIRST: a nonsense query can still return top-K nearest
         # neighbors (vector search always returns something), but if neither
         # branch's best raw score clears the confidence threshold, those
