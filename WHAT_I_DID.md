@@ -599,16 +599,92 @@ clear-margin pass is stronger than reverting to an equally-unvalidated older num
 
 ## Work to return to
 
-- [ ] **Block G:** implement stale-ingest reconciliation; Prefect crash detection is not job
-  redelivery (confirmed directly in the Section A2 crash experiment).
-- [ ] **Block G/K:** replace the `benchmark/bench.py --resilience` stub and prove zero dropped
-  sources, eventual completion, and no re-running of committed stages.
-- [ ] **Block H:** implement the register-and-capture pattern for `bench.py`'s recall check (see
-  round 3 above) rather than relying on the static `source_id` values recorded in
-  `queries.jsonl`.
-- [ ] **Block H:** the four `bench.py` TODOs generally (recall@10, decoupling ratio, throughput,
-  resilience) — none built yet.
-- [ ] **Block I:** tune to pass (`sla.json` stays as-is).
+- [x] **Block G:** stale-ingest reconciliation + poison-URI DLQ — done (commit `f492496`); see
+  LEARNINGS.md.
+- [x] **Block G/K:** `benchmark/bench.py --resilience` replaced with a real worker-kill + resume
+  proof — done (commit `aa0fef3`).
+- [x] **Block H:** register-and-capture recall check, decoupling overlap proof, throughput gate,
+  resilience gate — all four built and hardened across two independent review rounds (commit
+  `aa0fef3`); see LEARNINGS.md.
+- [~] **Block I:** tune to pass — one gate now passes reliably, one still doesn't. Diagnosed and
+  fixed six genuine bugs live rather than just cranking concurrency:
+  1. `docker-compose.yml` hardcoded `WORKER_CONCURRENCY: 2` in the worker service's `environment:`
+     block, silently overriding whatever `.env` said — fixed to read `${WORKER_CONCURRENCY:-2}`.
+  2. Prefect's `serve()` runner only polls Cloud for newly-scheduled runs every
+     `PREFECT_RUNNER_POLL_FREQUENCY` seconds (default 10) — measured via Prefect Cloud's own
+     flow-run timestamps that this dwarfed the ~3s of real parse/chunk/embed work per small
+     document. Fixed by passing `query_seconds=config.DISPATCH_INTERVAL_S` to `serve()`
+     (`src/worker.py`) so the runner's cadence matches our own admission tick.
+  3. With (2) fixed and concurrency raised, embed tasks started hitting
+     `ResponseHandlingException(ConnectTimeout(...))` against Qdrant Cloud — each ingest flow run
+     is an isolated subprocess (Prefect's own model) that builds a fresh `QdrantClient`, so N
+     concurrent flow runs means N simultaneous first-connection TLS handshakes, occasionally
+     timing out under load and falling into Prefect's 60s×2 retry backoff (~120s dead per
+     occurrence). Fixed with a short local retry around the upsert (`src/rag/vector_store.py`'s
+     `_upsert_with_retry`).
+  4. Also found fastembed's ONNX runtime defaults to using every visible core per process — the
+     first attempt bounded this via a new `TEXT_EMBED_THREADS` config set on the WORKER service.
+     **A guardrail review caught that this was dead code**: with `CLIP_SERVICE_URL` set (the
+     docker-compose default), `embed_docs`/`embed_query` route over HTTP to the single warm
+     `clip` service (`src/rag/embeddings.py`'s `if config.CLIP_SERVICE_URL:` branch) — the worker
+     never runs `_text_model()` itself. Worse, the review found the REAL bug one level up: a
+     single shared `threading.Lock()` guarded all four embedding calls in that one `clip` process
+     — CLIP images, CLIP text, BGE documents, BGE queries — so ingest's bulk document embeds and
+     search's own single query embed serialized behind each other regardless of which model
+     either used. First pass at a fix: split into `_clip_lock`/`_text_lock`
+     (`src/rag/embeddings.py`), sub-batched `embed_docs_local` at `TEXT_EMBED_BATCH` (32) so a
+     large document's embed call releases the BGE lock between sub-batches, and moved
+     `TEXT_EMBED_THREADS` onto the `clip` service in `docker-compose.yml`, where the model
+     actually runs. **Measured to not move the decoupling ratio at all** (three runs at
+     1.92/1.98/1.38, no better than before) — a second review round found why: this benchmark's
+     synthetic documents produce ~9 chunks each, below `TEXT_EMBED_BATCH=32`, so each document's
+     embed call is still exactly ONE sub-batch. The sub-batching had nothing to interleave against
+     for this workload; BGE ingestion and BGE search queries still fully serialized on
+     `_text_lock`.
+  5. Same review also found the dispatcher's `count_inflight()` + `wfq_claim()` were two separate,
+     unlocked reads (`src/db.py`): each dispatcher (one per worker replica) computed
+     `slots = cap - count_inflight()` from its own stale snapshot, so two dispatchers ticking
+     around the same moment could each admit up to their own computed `slots`, collectively
+     overshooting `DISPATCH_MAX_INFLIGHT` (the per-row atomic claim prevents double-claiming one
+     row, but said nothing about the total claimed per tick). Fixed with `db.claim_pending()`,
+     which wraps count + claim in one transaction under a Postgres advisory lock
+     (`pg_advisory_xact_lock`), serializing the whole sequence across every dispatcher process.
+  6. The actual fix for the decoupling ratio: stop routing search's query embed through the shared
+     `clip` service at all. `embed_query()` (`src/rag/embeddings.py`) now ALWAYS runs the bge model
+     locally, in the API's own process, even with `CLIP_SERVICE_URL` set — only `embed_docs` (bulk
+     ingest) still routes to the shared service. A search query is one small, latency-critical
+     call; giving it its own process and its own lock means it can never contend with ingest's
+     bulk embeds in the first place, not just wait less long for the same lock. Added a matching
+     warmup in `src/app.py`'s lifespan (mirrors `clip_service.py`'s own pattern) so the first search
+     isn't slow, and removed the now-dead `/embed/query` endpoint from `clip_service.py` (nothing
+     called it once ingestion kept using `/embed/docs` and search stopped calling it at all).
+
+  Added `tests/test_block_i_reliability.py` (17 stdlib-unittest tests, no live stack): the Qdrant
+  retry's success/failure/exhaustion/non-retryable paths, the embed_docs/embed_query routing
+  (including the corrected always-local rule for queries — pinning down exactly the regression
+  fix 6 addresses), the lock-split + sub-batching behavior, and `db.claim_pending()`'s
+  lock-then-count-then-claim ordering and arithmetic. Mutation-verified: reverting the lock split
+  back to one shared lock, reverting `claim_pending`'s slot arithmetic to ignore the inflight
+  count, and reverting `embed_query` to route remotely were each confirmed to make the
+  corresponding test fail.
+
+  Net result at the checked-in default (`WORKER_CONCURRENCY=5`, `DISPATCH_MAX_INFLIGHT=10`, 2
+  worker replicas): **decoupling ratio now passes reliably** — 1.09, 1.03, 0.89 across three
+  separate runs after fix 6 (target 1.3), a real and repeatable result, not a lucky sample.
+  Throughput remains short — **4.06–7.41 chunks/s** across the same runs (target 8), closest at
+  7.41 (same config, different run). Fixes 4-6 were real, independently verified correctness
+  improvements, and fix 6 in particular directly and repeatably fixed the gate it targeted — a
+  different outcome from fix 4 alone, which was correct but didn't move the number. The remaining
+  throughput gap is general resource contention across many concurrent flow-run subprocesses (CPU,
+  Postgres pool, network) sharing one Docker Desktop VM, not a single identifiable lock or race —
+  sweeping cap 8/10/12 all landed in the 4-7.4 chunks/s range with no clear monotonic trend, which
+  is itself the signal that further local tuning isn't informative. `sla.json` was NOT loosened.
+  Worth re-measuring on the real Fly deployment (Block J), where the API and worker get genuinely
+  separate machine resources instead of sharing one CPU pool.
+- [x] **Block N:** `docker compose up -d --scale worker=2` + `DISPATCH_MAX_INFLIGHT` sized to
+  `replicas x WORKER_CONCURRENCY` — done; both replicas' dispatcher logs confirmed identical
+  `max in-flight` matching the formula, and both were observed claiming backfill documents across
+  the Block I runs above.
 - [ ] **Block J:** create or select the permanent Fly app and update both `fly.toml`'s `app` value
   and `CLIP_SERVICE_URL` to the same app name.
 - [ ] **Block J:** verify the intended GitHub deployment branch after `fly launch`; it may rewrite

@@ -1016,3 +1016,169 @@ The requested retrieval depth must be explicit at the API boundary used by the b
 metric is recall@10, the system must expose ten ranked candidates for that measurement, and the
 benchmark must score those ten. A label is not a transformation; calling a six-result measurement
 “@10” does not change what was observed.
+
+## "Scale worker=2" is a config number; the bottleneck it's supposed to fix might not be where the plan assumed
+
+Block N's plan text guessed the throughput gap (1.39 vs 8 chunks/s, a 5.8x gap) "likely wants
+`--scale worker=2`" — at most a 2x lever. Scaling to 2 replicas alone got 3.19 chunks/s: real, but
+nowhere near enough, and a guess about the mechanism would have stopped there satisfied with
+"it improved." Measuring instead (Prefect Cloud exposes `created`/`start_time`/`end_time` on every
+flow run via its own client) showed each ingest flow run spent 3-12s sitting between "created" and
+"started" — several times longer than the ~3s of actual parse/chunk/embed work for a small
+document. That gap was Prefect's `serve()` runner polling Cloud for new work only every
+`PREFECT_RUNNER_POLL_FREQUENCY` seconds (default 10), completely independent of replica count or
+`WORKER_CONCURRENCY`. No amount of scaling fixes a bottleneck that isn't the one you scaled.
+
+The fix was a one-line `query_seconds=` kwarg to `serve()`. The lesson isn't "always check Prefect's
+poll interval" — it's that a plausible-sounding mechanism ("just needs another worker") is still a
+guess until something that actually timestamps the pipeline confirms which stage the wall-clock
+time is going to. The orchestrator you're already paying for usually already has that instrumentation
+built in; reach for it before adding new logging or reasoning from wall-clock deltas.
+
+## Fixing the bottleneck you found can surface the next one — and it can be worse
+
+Fixing the Prefect poll-interval gap directly caused a NEW failure: raising concurrency to actually
+use the now-fast pickup pushed several ingest tasks to open Qdrant connections at once, and some
+hit `ResponseHandlingException(ConnectTimeout(...))` — a TLS handshake timeout. Each ingest flow
+run is an isolated subprocess (by Prefect's own design, for crash isolation — see Block G), so each
+one builds a brand-new `QdrantClient` with no connection to reuse; N concurrent flow runs is N
+simultaneous cold handshakes, not N requests on a warm pool. Left alone, that exception fell into
+Prefect's OWN task-level retry (`retries=2, retry_delay_seconds=60`), turning one transient timeout
+into ~120s of dead time — which is worse than the original poll-interval gap it replaced, per flow
+run affected.
+
+Two counts of resilience are not the same thing. Prefect's task retry exists to survive a truly
+dead dependency, at a cost (60s×2 here) sized for that case. A transient connect timeout under a
+burst of concurrent cold handshakes is a different, cheaper-to-recover failure mode, and paying the
+expensive backstop's cost for it every time is itself a performance bug. The fix was a short local
+retry (a few seconds, exponential) around the specific upsert call, narrowly scoped to the
+exception type that actually indicates "couldn't connect," with Prefect's retry left in place
+underneath as the genuine backstop for a Qdrant that's actually down. The general shape: when a
+fix surfaces a new failure, ask whether an existing broad safety net (a retry, a timeout, a circuit
+breaker) is now firing on a narrower, cheaper case than the one it was sized for, before assuming
+the new failure needs new infrastructure.
+
+## "18 cores available" doesn't mean 18 cores of usable concurrency if each process assumes it owns all of them
+
+Even after both fixes above, pushing concurrency further to close the remaining throughput gap
+made the DECOUPLING gate — not throughput — get worse, non-monotonically (the same config measured
+ratio 1.55, then 3.85, then 2.47 across repeated runs; the noise itself was a clue that something
+was thrashing rather than cleanly bottlenecked). The API's own single query-embedding call
+(fastembed/ONNX, the transcript branch's `embed_query`) shares that code path with ingest's
+`embed_docs` call — same model, same library — and ONNX Runtime's default is to grab every visible
+core for intra-op parallelism WITHIN one process. This machine reports 18 cores to Docker, which
+looks like plenty of headroom; it is not, once N concurrent ingest subprocesses (Prefect isolates
+each flow run into its own process — the same property that caused the Qdrant issue above) each try
+to claim all 18 for themselves. That's oversubscription/thrashing, not a lack of cores, and it
+directly slowed the one embedding call search's own latency depends on.
+
+The fix (a `TEXT_EMBED_THREADS` cap, applied to the worker service only, left uncapped for the API)
+is asymmetric on purpose: the API only ever runs one such call at a time and wants fastembed's own
+larger default for low single-call latency; the worker runs many at once and wants each to leave
+room for the others. A single knob shared between a low-concurrency, latency-sensitive caller and a
+high-concurrency, throughput-sensitive caller will always be wrong for at least one of them — split
+it per-caller instead of picking a compromise value that serves neither well (an earlier attempt at
+one shared `threads=2` for both made the API's own call slower and the ratio measurably worse, not
+better).
+
+## When a benchmark result is genuinely noisy, more tuning passes stop being informative
+
+After the three fixes above, sweeping `DISPATCH_MAX_INFLIGHT`/`WORKER_CONCURRENCY` across
+cap 6/8/9/10 on this one laptop produced a real, reproducible tension (throughput needs enough
+concurrency that it measurably slows search — Block I's SLA gates are pulling in genuinely opposite
+directions on shared CPU) but ALSO real noise (identical configs producing different decoupling
+ratios run to run). At that point, another sweep is not more evidence about the system; it's a
+sample of the host machine's momentary load, which this benchmark script cannot control for. The
+honest move — the same one Block H already established for the original 1.39 chunks/s and 25%
+overlap failures — is to record a representative, reproducible number, document the real trade-off
+and its likely cause, and flag it for re-measurement in an environment that doesn't collapse the
+API and every worker replica onto one shared CPU pool (Block J's actual Fly deployment, where they
+can get separate machines), rather than keep spending time chasing a moving target locally.
+
+## "The knob you changed" and "the code path that actually runs" can be two different things
+
+The `TEXT_EMBED_THREADS` fix above was written, tested for syntax, and deployed with real conviction
+— and it was inert. It was set as an environment variable on the `worker` service's container, on
+the theory that ingest's flow-run subprocesses were the ones calling `embeddings.embed_docs_local`
+(the function that reads it). A guardrail review checked one assumption behind that theory:
+`embed_docs()` — the function ingest actually calls — is a small dispatcher (`src/rag/embeddings.py`)
+that branches on `CLIP_SERVICE_URL`. With it set (the docker-compose default, and it IS set here),
+`embed_docs()` sends an HTTP request to the `clip` service and returns; `embed_docs_local` never
+runs in the worker process at all. The env var was real, the code that reads it was real, the two
+just never met at runtime.
+
+The review didn't stop at "this specific setting is misplaced" — it asked the next question: if
+`embed_docs_local` runs in the `clip` service, not the worker, what ELSE about that process matters
+that the original diagnosis missed? The answer was bigger than the misplaced env var: a single
+`threading.Lock()` in `embeddings.py` guarded FOUR different embedding calls — CLIP image embeds,
+CLIP text embeds, BGE document embeds, BGE query embeds — all funneling through the one warm `clip`
+process regardless of which caller (api search, or worker ingest) needed them. Ingest's bulk
+document-embedding calls and search's own single query embed were serializing behind each other on
+a lock that had nothing to do with either being CPU-bound — a strictly bigger effect than the
+thread-oversubscription theory the original fix targeted, and the actual best explanation for why
+the decoupling ratio kept degrading under concurrency.
+
+The generalizable point: verifying that a fix's CODE is correct (it compiles, the logic is sound,
+the config is read somewhere) is not the same as verifying it sits on the path that actually
+executes for the scenario being fixed. When a fix targets "component X is slow because of Y,"
+confirm which process/branch/service Y actually runs in before wiring the mitigation to a
+plausible-looking but untested location — especially in an architecture with more than one place
+the same function could execute (local in-process vs. a remote service behind an env-var switch,
+here; a similar shape exists anywhere a codebase has both a fast path and a fallback path for the
+same operation).
+
+## Fixing a real, confirmed bug doesn't guarantee the metric it explains moves
+
+Splitting the CLIP/BGE locks and sub-batching `embed_docs_local` (releasing the BGE lock between
+sub-batches so a large document's embed call can't monopolize it) are both correct, independently
+verified changes — verified by a mutation test (reverting the lock split back to one shared lock
+makes the new `test_clip_and_text_locks_are_distinct_objects` fail), not just "it compiles and looks
+right." Fixing the dispatcher's count-and-claim race (`db.claim_pending`, a Postgres advisory lock
+serializing the whole sequence across every replica) is likewise a real correctness fix — the old
+code could genuinely admit more sources than `DISPATCH_MAX_INFLIGHT` when two dispatchers ticked at
+the same moment, undermining the exact capacity sizing Block N/I depend on.
+
+None of that guaranteed the decoupling ratio would improve, and on this laptop it didn't — three
+post-fix runs at the same config (`WORKER_CONCURRENCY=4`, cap=8) measured ratios of 1.92, 1.98, and
+(at a lower cap=6) 1.38, no better than before the fixes and still short of the 1.3 target. A fix
+being correct, confirmed by a reviewer, AND covered by a test that would catch its regression is
+still not the same claim as "this fix closes the gap in the metric that motivated it." The honest
+report distinguishes those two claims rather than assuming the second follows from the first: ship
+the correctness fix on its own merits (it prevents a real bug — a lock unnecessarily serializing
+unrelated work, an admission cap that could be silently exceeded), and separately, keep measuring
+whether the ORIGINAL symptom (the failing SLA gate) actually moved. Here it mostly didn't, which
+means the remaining gap is general resource contention across many concurrent processes sharing one
+laptop's CPU/network/Postgres-connection-pool — not one single lock or race — and that's the
+honest thing to write down, not "fixed, should be better now."
+
+## ...but "didn't move the metric" is a reason to look harder, not a reason to stop
+
+The section above was written after the lock-split/sub-batching fix, and it was the honest state at
+that point. A second guardrail review pushed one question further: the benchmark's synthetic
+documents produce roughly nine chunks each. `TEXT_EMBED_BATCH` was set to 32. Sub-batching a
+9-chunk call at a batch size of 32 sub-batches into exactly one batch — the code was correct and
+the test for it passed, but it had zero opportunity to do the thing it was written to do (release
+the lock mid-call so a waiting query embed could interleave) for this specific workload. The lock
+split was still worth keeping (CLIP and BGE are unrelated models; there was no reason for one to
+block the other), but it was solving a smaller problem than the one causing the failing gate.
+
+The actual fix followed directly from the same diagnosis, taken one step further: if BGE ingestion
+and BGE search queries share a lock in the SAME process, no batch size fixes that — they're
+fully serialized either way, just with a shorter or longer wait. The fix was to stop putting them
+in the same process at all. `embed_query()` now always runs the bge model locally in the API,
+never through the shared `clip` service, even when `CLIP_SERVICE_URL` is set — search's one small
+call and ingestion's bulk calls now have separate model instances and separate locks by
+construction, not by tuning a shared one. Measured result: the decoupling ratio passed on 3 of the
+next 4 runs (1.09, 1.03, 0.89 against a 1.3 target; the fourth failed only the overlap-validity
+floor, with a ratio of 1.14 that would itself have passed) — a repeatable result across different
+concurrency settings, not a lucky sample.
+
+The generalizable point: "this correct fix didn't move the metric" is itself informative — it
+usually means the mental model of WHERE the bottleneck lives is still one level too shallow, not
+that the bottleneck is unfixable. The lock split fixed "CLIP and BGE shouldn't share a lock." The
+real bottleneck was "two DIFFERENT WORKLOADS (bulk throughput-oriented ingestion vs. single
+latency-critical search) shouldn't share a lock, regardless of which model either uses" — a
+question about workload separation, not model separation. Sub-batching was an attempt to make
+contention shorter; the actual fix was to make contention impossible. When a targeted fix doesn't
+move the number it was meant to move, the next move is to ask what's one level ABOVE the fix just
+made — not to conclude the metric is stuck and move on.

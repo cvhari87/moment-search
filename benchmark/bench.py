@@ -426,17 +426,31 @@ def measure_search_p95(n: int, user_id: str) -> tuple[float, float]:
     return (p95(lat) if lat else float("inf")), error_rate
 
 
-def _poll_active(user_id: str, ids: set[str], stop_event: threading.Event, poll_s=0.5) -> list[bool]:
+def _poll_active(user_id: str, ids: set[str], stop_event: threading.Event, poll_s=0.5,
+                  histogram: list[dict[str, int]] | None = None) -> list[bool]:
     """Background sampler for the decoupling check: one True/False per poll
     for whether ANY tracked backfill id was in a genuinely EXECUTING status
     at that instant (not 'pending'/'queued', which aren't consuming any
     resources search would contend with). Used to prove 'during' sampling
     actually overlapped real ingest work, not just that some rows hadn't
-    reached a terminal state yet."""
+    reached a terminal state yet.
+
+    If `histogram` is passed, each poll also appends a status -> count dict
+    across ALL tracked ids (pending/queued/active/terminal) — diagnostic only,
+    never gated, so it can't change pass/fail. It exists to answer WHY overlap
+    is low when it is: e.g. most ids sitting in 'queued' (admitted but not yet
+    executing) points at DISPATCH_MAX_INFLIGHT/capacity, not at parse/embed
+    being slow — see Block I in Assignment3_Plan.md."""
     samples = []
     while not stop_event.is_set():
         rows = _sources_for(user_id)
         samples.append(any(rows.get(i, {}).get("status") in _ACTIVE_STATUSES for i in ids))
+        if histogram is not None:
+            counts: dict[str, int] = {}
+            for i in ids:
+                s = rows.get(i, {}).get("status") or "missing"
+                counts[s] = counts.get(s, 0) + 1
+            histogram.append(counts)
         time.sleep(poll_s)
     return samples
 
@@ -475,8 +489,10 @@ def measure_decoupling_and_throughput(n_docs=20, n_pages=3, n_samples=40, min_ov
 
     stop_event = threading.Event()
     activity: list[bool] = []
+    histogram: list[dict[str, int]] = []
     poll_thread = threading.Thread(
-        target=lambda: activity.extend(_poll_active(BACKFILL_USER, ids, stop_event)))
+        target=lambda: activity.extend(
+            _poll_active(BACKFILL_USER, ids, stop_event, histogram=histogram)))
     poll_thread.start()
 
     during, err_during = measure_search_p95(n_samples, RECALL_USER)
@@ -489,6 +505,15 @@ def measure_decoupling_and_throughput(n_docs=20, n_pages=3, n_samples=40, min_ov
     print(f"[decoupling] {sum(activity)}/{len(activity)} polls ({overlap_frac:.0%}) found "
          f"ACTIVE (parsing/chunking/embedding) ingest work during 'during' sampling — "
          f"{'OK' if overlap_ok else f'BELOW the {min_overlap_frac:.0%} minimum, gate forced to FAIL'}")
+    if histogram:
+        totals: dict[str, int] = {}
+        for counts in histogram:
+            for status, n in counts.items():
+                totals[status] = totals.get(status, 0) + n
+        n_polls = len(histogram)
+        avg = {status: round(n / n_polls, 2) for status, n in sorted(totals.items())}
+        print(f"[decoupling] diagnostic — avg document count per status across "
+             f"{n_polls} 'during' polls (not gated): {avg}")
 
     rows_final = _wait_terminal(BACKFILL_USER, ids, timeout=max(120.0, 6.0 * len(ids)))
     t_backfill_end = time.time()

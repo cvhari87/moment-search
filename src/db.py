@@ -365,8 +365,11 @@ def wfq_claim(limit: int, *, fair: bool = True) -> list[dict]:
       across all users — "useful for A/B teaching the difference" per the
       module docstring in src/dispatcher.py.
 
-    The UPDATE ... WHERE status='pending' RETURNING is the atomic claim:
-    if two dispatchers race, each row is handed out once.
+    The UPDATE ... WHERE status='pending' RETURNING is atomic against
+    another dispatcher claiming the SAME row twice, but says nothing about
+    the TOTAL claimed across dispatchers in one tick — see claim_pending()
+    below, which is what src/dispatcher.py actually calls; this function is
+    kept as the row-selection primitive it wraps.
     """
     if limit <= 0:
         return []
@@ -388,18 +391,86 @@ def wfq_claim(limit: int, *, fair: bool = True) -> list[dict]:
         """
     )
     with pool().connection() as conn:
-        picked = conn.execute(order_sql, (limit,)).fetchall()
-        ids = [r["id"] for r in picked]
-        if not ids:
+        return _claim_with_conn(conn, limit, order_sql)
+
+
+def _claim_with_conn(conn, limit: int, order_sql: str) -> list[dict]:
+    picked = conn.execute(order_sql, (limit,)).fetchall()
+    ids = [r["id"] for r in picked]
+    if not ids:
+        return []
+    return conn.execute(
+        """
+        UPDATE ms_videos SET status = 'queued', generation = generation + 1, updated_at = now()
+        WHERE id = ANY(%s) AND status = 'pending'
+        RETURNING id, user_id, kind, generation
+        """,
+        (ids,),
+    ).fetchall()
+
+
+# Arbitrary fixed key for the WFQ admission critical section below — any
+# int64 works, it just needs to be the same constant everywhere this lock is
+# taken so every dispatcher process (one per worker replica) contends for
+# the SAME advisory lock.
+_DISPATCH_ADVISORY_LOCK_KEY = 0x4D53_5746_51  # "MSWFQ" in hex, arbitrary
+
+
+def claim_pending(cap: int, *, fair: bool = True) -> list[dict]:
+    """Atomically compute free capacity AND claim pending sources as ONE
+    locked operation, across every dispatcher process (one per worker
+    replica) — this is what src/dispatcher.py calls, not wfq_claim directly.
+
+    count_inflight() and wfq_claim() used to run as two separate, unlocked
+    reads (each opening its own connection/transaction): dispatcher.py
+    computed `slots = cap - count_inflight()` from one snapshot, then called
+    wfq_claim(slots) moments later. wfq_claim's own UPDATE...WHERE
+    status='pending' RETURNING correctly prevents two dispatchers from
+    claiming the SAME row twice, but says nothing about the TOTAL claimed
+    per tick: two dispatchers reading the same stale inflight count around
+    the same moment could each independently claim up to their OWN computed
+    `slots`, collectively admitting more than `cap` (found in review).
+    Harmless for correctness (Prefect still runs each row once), but it
+    defeats the whole point of sizing DISPATCH_MAX_INFLIGHT to actual
+    capacity (Block N/I).
+
+    A Postgres advisory transaction lock (released automatically on commit
+    or rollback, so a crashed dispatcher can never leave it held) serializes
+    the whole count-then-claim sequence across every connection/process —
+    only one dispatcher, anywhere, can be inside this critical section at
+    once. Cost is negligible: this runs once per DISPATCH_INTERVAL_S per
+    replica and holds the lock for a single count + claim query, not for
+    the Prefect scheduling calls that follow (those happen after this
+    function returns, outside the lock)."""
+    if cap <= 0:
+        return []
+    order_sql = (
+        """
+        SELECT id FROM (
+            SELECT id, row_number() OVER (
+                PARTITION BY user_id ORDER BY created_at, id) AS rn
+            FROM ms_videos WHERE status = 'pending'
+        ) t
+        ORDER BY rn, id
+        LIMIT %s
+        """
+        if fair else
+        """
+        SELECT id FROM ms_videos WHERE status = 'pending'
+        ORDER BY created_at, id
+        LIMIT %s
+        """
+    )
+    with pool().connection() as conn:
+        conn.execute("SELECT pg_advisory_xact_lock(%s)", (_DISPATCH_ADVISORY_LOCK_KEY,))
+        inflight = conn.execute(
+            "SELECT count(*) AS n FROM ms_videos WHERE status = ANY(%s)",
+            (list(INFLIGHT_STATUSES),),
+        ).fetchone()["n"]
+        slots = cap - inflight
+        if slots <= 0:
             return []
-        return conn.execute(
-            """
-            UPDATE ms_videos SET status = 'queued', generation = generation + 1, updated_at = now()
-            WHERE id = ANY(%s) AND status = 'pending'
-            RETURNING id, user_id, kind, generation
-            """,
-            (ids,),
-        ).fetchall()
+        return _claim_with_conn(conn, slots, order_sql)
 
 
 # ── Crash safety / reconciler (Block G) ──────────────────────────────────────

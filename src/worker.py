@@ -20,6 +20,7 @@ import time
 from prefect import serve
 from prefect.deployments.runner import EntrypointType
 
+from . import config
 from .db import init_schema
 from .ingest.document import ingest_document
 from .ingest.pipeline import ingest_video
@@ -68,6 +69,21 @@ def main():
                 ingest_video.to_deployment(name="ingest", entrypoint_type=EntrypointType.MODULE_PATH),
                 ingest_document.to_deployment(name="ingest", entrypoint_type=EntrypointType.MODULE_PATH),
                 limit=limit,
+                # Block I: measured live via Prefect Cloud's own flow-run
+                # timestamps that Prefect's runner (this serve() call) only
+                # polls Cloud for newly-scheduled runs every
+                # PREFECT_RUNNER_POLL_FREQUENCY seconds (default 10) — a run
+                # our OWN dispatcher just admitted could then sit doing
+                # nothing for up to 10s before the runner even notices it,
+                # regardless of free WORKER_CONCURRENCY slots. That dwarfed
+                # the ~3s of actual parse/chunk/embed work for small
+                # documents and was the real throughput bottleneck, not
+                # local concurrency. Aligning the runner's own poll cadence
+                # to DISPATCH_INTERVAL_S (our admission tick) means a run is
+                # noticed about as soon as our own loop could have admitted
+                # the next one anyway — polling faster than that buys
+                # nothing but extra Prefect Cloud API calls.
+                query_seconds=config.DISPATCH_INTERVAL_S,
             )
             break  # clean shutdown
         except KeyboardInterrupt:

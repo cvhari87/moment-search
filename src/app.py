@@ -24,7 +24,7 @@ from . import config, db
 from .api.documents import router as documents_router
 from .api.search import router as search_router
 from .api.videos import router as videos_router
-from .rag import vector_store
+from .rag import embeddings, vector_store
 
 
 @asynccontextmanager
@@ -48,6 +48,19 @@ async def lifespan(app: FastAPI):
             vector_store.ensure_text_collection()  # transcript (bge text)
     except Exception as exc:
         print(f"[startup] Qdrant not ready ({exc!r}) — search degrades to empty results")
+    # embed_query() always runs the bge model LOCALLY in this process now
+    # (see src/rag/embeddings.py) — even with CLIP_SERVICE_URL set, unlike
+    # embed_docs, which still routes bulk ingest embedding to that shared
+    # service. A search query is one small, latency-critical call; running
+    # it in the same process as ingest's bulk document embeds meant it
+    # contended for the same lock (Block I). Warm it now, not on the first
+    # question, same reasoning as clip_service.py's own warmup.
+    if config.ENABLE_TRANSCRIPT and config.TEXT_EMBED_PROVIDER != "openai":
+        try:
+            embeddings.embed_query_local("warmup")
+            print(f"[startup] local query-embed model {config.TEXT_EMBED_MODEL} warm")
+        except Exception as exc:
+            print(f"[startup] query-embed warmup failed ({exc!r}) — first search will be slow")
     yield
 
 

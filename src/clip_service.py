@@ -79,8 +79,3 @@ def embed_text(req: TextRequest):
 @app.post("/embed/docs")
 def embed_docs(req: DocsRequest):
     return {"vectors": embeddings.embed_docs_local(req.texts).tolist()}
-
-
-@app.post("/embed/query")
-def embed_query(req: TextRequest):
-    return {"vector": embeddings.embed_query_local(req.text).tolist()}

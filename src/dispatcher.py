@@ -28,8 +28,10 @@ FIFO by creation time — "useful for A/B teaching the difference," not a
 bypass of this loop.
 
 Runs as a background thread in worker.py. With one worker that's exact; with
-several, each runs a dispatcher — the atomic claim keeps sources handed out
-once, at worst mildly over-admitting (harmless; Prefect still caps execution).
+several, each runs a dispatcher — db.claim_pending() serializes the whole
+count-then-claim sequence across every replica (a Postgres advisory lock),
+so the total admitted per tick, system-wide, never exceeds
+DISPATCH_MAX_INFLIGHT even when several dispatchers tick at once.
 """
 from __future__ import annotations
 
@@ -42,10 +44,7 @@ from . import config, db, jobs
 def dispatch_once() -> int:
     """Admit as many pending sources as free capacity allows, in
     ENABLE_FAIR_DISPATCH order. Returns how many were dispatched this tick."""
-    slots = config.DISPATCH_MAX_INFLIGHT - db.count_inflight()
-    if slots <= 0:
-        return 0
-    claimed = db.wfq_claim(slots, fair=config.ENABLE_FAIR_DISPATCH)
+    claimed = db.claim_pending(config.DISPATCH_MAX_INFLIGHT, fair=config.ENABLE_FAIR_DISPATCH)
     for row in claimed:
         try:
             if row.get("kind", "video") == "video":

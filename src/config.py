@@ -216,6 +216,30 @@ TEXT_EMBED_DIM = _int("TEXT_EMBED_DIM", 1536 if _TE_OPENAI else 384)
 TEXT_EMBED_API_KEY = os.getenv("TEXT_EMBED_API_KEY", "").strip()
 TEXT_EMBED_BASE_URL = os.getenv("TEXT_EMBED_BASE_URL", "").strip()
 TEXT_EMBED_VERSION = os.getenv("TEXT_EMBED_VERSION", f"{TEXT_EMBED_MODEL}-v1")
+# fastembed's ONNX runtime defaults to using every visible core for intra-op
+# parallelism WITHIN one process. Unset (0) lets fastembed pick its own
+# default. Matters on whichever process actually holds the bge model
+# in-process: embed_docs_local (bulk ingest) runs in the `clip` service when
+# CLIP_SERVICE_URL is set, but embed_query_local (search) ALWAYS runs
+# locally in the API now, regardless of CLIP_SERVICE_URL — see
+# embeddings.embed_docs/embed_query. docker-compose.yml sets this on the
+# `clip` service; the API gets fastembed's own default (it only ever runs
+# one small query call at a time, not a bulk batch). An earlier attempt set
+# this on the worker service instead, which turned out to be dead code —
+# the worker never holds this model in-process at all (found in review).
+TEXT_EMBED_THREADS = _int("TEXT_EMBED_THREADS", 0)
+# embed_docs_local's own sub-batch size — a bulk ingest embed call chunks
+# through _text_model() this many texts at a time, releasing _text_lock
+# between sub-batches instead of holding it for the whole call. Cheap
+# insurance for documents with many chunks, but NOT what fixed the
+# decoupling-ratio SLA gate: this benchmark's synthetic documents produce
+# ~9 chunks each, below this default, so sub-batching never triggers for
+# them and made no measured difference on its own (found in review). What
+# actually fixed the gate was embed_query running in a different PROCESS
+# from embed_docs_local entirely (see embed_query's docstring) — sub-batching
+# only bounds how long two calls in the SAME process wait on each other, it
+# doesn't remove calls that never share a process in the first place.
+TEXT_EMBED_BATCH = _int("TEXT_EMBED_BATCH", 32)
 # Transcript chunking: group caption cues into ~CHUNK_SECONDS windows so a chunk
 # is a coherent spoken passage with a real t_start/t_end, not one tiny cue.
 TRANSCRIPT_CHUNK_SECONDS = _float("TRANSCRIPT_CHUNK_SECONDS", 20.0)

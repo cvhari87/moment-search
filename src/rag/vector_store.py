@@ -18,12 +18,14 @@ Postgres and are joined at answer time.
 """
 from __future__ import annotations
 
+import time
 import uuid
 from typing import Any, Iterable
 
 import numpy as np
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as qm
+from qdrant_client.http.exceptions import ResponseHandlingException
 
 from ..config import (
     CLIP_DIM,
@@ -136,6 +138,32 @@ def ensure_text_collection() -> None:
     _ensure(TEXT_COLLECTION, TEXT_EMBED_DIM)
 
 
+_UPSERT_RETRIES = 3
+_UPSERT_RETRY_BASE_S = 1.0
+
+
+def _upsert_with_retry(collection: str, points: list[qm.PointStruct]) -> None:
+    """Each ingest flow run is an isolated subprocess (src/worker.py) that
+    builds its own fresh QdrantClient, so a burst of concurrent flow runs
+    means a burst of simultaneous first-connection TLS handshakes to Qdrant
+    Cloud — measured live (Block I) to occasionally time out under load
+    (ResponseHandlingException wrapping a ConnectTimeout) even though a fresh
+    attempt succeeds immediately after. Left uncaught, that falls through to
+    Prefect's own task-level retry (t_embed: retries=2,
+    retry_delay_seconds=60 — ~120s of dead time per occurrence, which is what
+    a live Block I run showed). A short local retry absorbs the transient
+    case in a few seconds; a genuinely unreachable Qdrant still falls through
+    to Prefect's retry as the backstop after this exhausts."""
+    for attempt in range(_UPSERT_RETRIES):
+        try:
+            client().upsert(collection_name=collection, points=points, wait=True)
+            return
+        except ResponseHandlingException:
+            if attempt == _UPSERT_RETRIES - 1:
+                raise
+            time.sleep(_UPSERT_RETRY_BASE_S * (2 ** attempt))
+
+
 def upsert_frames(user_id: str, video_id: str, ids: Iterable[int],
                   vectors: np.ndarray, payloads: list[dict[str, Any]]) -> None:
     points = [
@@ -143,7 +171,7 @@ def upsert_frames(user_id: str, video_id: str, ids: Iterable[int],
         for idx, vec, payload in zip(ids, vectors, payloads)
     ]
     if points:
-        client().upsert(collection_name=QDRANT_COLLECTION, points=points, wait=True)
+        _upsert_with_retry(QDRANT_COLLECTION, points)
 
 
 def search(vector: np.ndarray, user_id: str, *, top_k: int,
@@ -184,7 +212,7 @@ def upsert_chunks(user_id: str, video_id: str, vectors: np.ndarray,
         for i, (vec, payload) in enumerate(zip(vectors, payloads))
     ]
     if points:
-        client().upsert(collection_name=TEXT_COLLECTION, points=points, wait=True)
+        _upsert_with_retry(TEXT_COLLECTION, points)
 
 
 def search_text(vector: np.ndarray, user_id: str, *, top_k: int,
