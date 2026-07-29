@@ -74,6 +74,69 @@ This is the target read path after Block F:
 If retrieval finds nothing, the system must return no citations rather than inventing a plausible
 page or timestamp. The LLM is the writer, not the source of truth for locators.
 
+### The queue prepares sources; it does not answer searches
+
+There are two very different paths through the application:
+
+```text
+INGESTION (slow, queued)                 SEARCH (fast, never queued)
+
+register source                          ask question
+      |                                        |
+      v                                        v
+Postgres: pending                        embed the question
+      |                                        |
+      v                                        v
+fair dispatcher                          search Qdrant immediately
+      |                                        |
+      v                                        v
+Prefect flow -> worker                   fuse and rank evidence
+      |                                        |
+      v                                        v
+parse/embed/index                        cited answer
+```
+
+The queue exists because preparing a source can take seconds or minutes. A video may need to be
+downloaded, sampled, transcribed, and embedded. A paper or deck may need to be downloaded, parsed,
+chunked, visually captioned, and embedded. Doing that inside an API request would make the browser
+wait, consume API capacity, and make failures difficult to resume. Registration therefore returns
+`202 Accepted` quickly and leaves the expensive work to Prefect-served workers.
+
+Search is different. It only searches content that has already reached `indexed`. The question is
+embedded, Qdrant is queried, the results are fused, and the cited answer is returned immediately.
+Putting searches behind the ingestion queue would let a large upload backlog delay normal users,
+violating the requirement that search stay responsive during backfills.
+
+### How each source becomes searchable
+
+All source types use the same admission machinery, but their workers produce different evidence:
+
+| Source | Worker processing | Searchable representation | Locator |
+|---|---|---|---|
+| Video | Download, sample representative frames, obtain captions when available, chunk and embed | Frames in the visual collection; transcript chunks in the shared text collection | Timestamp |
+| PDF paper | Validate and parse the PDF page-by-page, create page-aware chunks, embed text | Chunks in the shared text collection | Page |
+| PDF slide deck | Extract each slide's text; visually caption text-poor slides; embed the resulting chunks | Chunks/captions in the shared text collection | Slide |
+
+At query time, the visual video branch and the shared text branch are searched independently and
+then fused. A single answer can therefore cite a video at `05:32`, a paper on page 5, and a deck on
+slide 4. Every search applies the user's tenant filter before results are returned.
+
+Native `.ppt`/`.pptx` parsing is not required by the current plan. The reliable presentation path
+is to export the presentation to PDF first; native PowerPoint support remains optional. Calling a
+PDF a `deck` changes its locator semantics from page to slide and enables the text-poor-slide
+captioning path.
+
+The four queue participants have separate responsibilities:
+
+- **Postgres** records `pending` work and owns lifecycle state.
+- **The dispatcher** chooses which source enters next and applies either fair round-robin or FIFO
+  ordering. It is always the only component that submits ingestion runs to Prefect.
+- **Prefect** coordinates and exposes the admitted multi-stage run.
+- **The worker** performs the actual download, parsing, chunking, embedding, and indexing.
+
+This separation is why videos, papers, and decks can share one queue without making interactive
+search wait behind them.
+
 ### What exists now and what we are still building
 
 At the end of Section A2, the video ingestion and video search paths work. The infrastructure
@@ -179,8 +242,9 @@ committed boundary.
 The queue is a collaboration between **Postgres, the dispatcher, Prefect, and workers**:
 
 1. The API validates a registration and inserts a `pending` manifest row.
-2. With fair dispatch enabled, the Postgres WFQ dispatcher admits pending rows across users only
-   when an inflight slot is available. With it disabled, the API enqueues immediately.
+2. The Postgres dispatcher admits pending rows only when an inflight slot is available. With fair
+   dispatch enabled it rotates across users; with fair dispatch disabled it uses FIFO ordering.
+   In both modes, the dispatcher remains the only path that submits a run to Prefect.
 3. `run_deployment(timeout=0)` creates a Prefect flow run without waiting for ingestion to finish.
 4. A serving worker accepts the run and executes the flow's configured tasks.
 5. Only after a successful Qdrant upsert may the application mark the source `indexed`.

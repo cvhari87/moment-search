@@ -526,13 +526,18 @@ function renderSources(){
     const tags=mods.map(m=>m==="frame"
       ? '<span class="text-[9px] px-1 rounded bg-coral/15 text-coral2">seen</span>'
       : '<span class="text-[9px] px-1 rounded bg-[#cfe8d6] text-[#1f7a43]">said</span>').join(" ");
-    // Text-only moments have no frame; they're always YouTube, so fall back to
-    // the video's thumbnail instead of an empty "(no frame)" placeholder.
+    // Text-only VIDEO moments have no frame but are always YouTube, so fall
+    // back to the video's thumbnail instead of an empty "(no frame)"
+    // placeholder. Documents never have a frame at all — a page/slide number
+    // placeholder instead, not the video-shaped fallback below.
+    const isDoc = c.kind==="paper"||c.kind==="deck";
     const yid = ytId(c);
-    const img = c.thumbnail || (yid ? `https://img.youtube.com/vi/${yid}/hqdefault.jpg` : null);
+    const img = c.thumbnail || (!isDoc && yid ? `https://img.youtube.com/vi/${yid}/hqdefault.jpg` : null);
     const thumb = img
       ? `<img loading="lazy" src="${esc(img)}" class="w-full h-full object-cover" onerror="this.style.opacity=0">`
-      : `<div class="w-full h-full flex items-center justify-center text-muted text-xs p-2 text-center">transcript moment<br>(no frame)</div>`;
+      : isDoc
+        ? `<div class="w-full h-full flex items-center justify-center text-muted text-xs p-2 text-center">${c.kind==="deck"?"📑":"📄"} ${esc(c.timestamp)}</div>`
+        : `<div class="w-full h-full flex items-center justify-center text-muted text-xs p-2 text-center">transcript moment<br>(no frame)</div>`;
     const quote = c.transcript
       ? `<div class="text-[11px] text-muted italic mt-1 line-clamp-2">“${esc(c.transcript)}”</div>` : "";
     return `
@@ -557,22 +562,31 @@ function ytId(c){ if(c.video_id&&c.video_id.startsWith("yt_")) return c.video_id
   const m=(c.url||"").match(/(?:youtu\.be\/|v=)([\w-]{11})/); return m?m[1]:null; }
 function playCitation(n){
   const c=CITES.find(x=>x.n===n); if(!c)return;
+  const isDoc = c.kind==="paper"||c.kind==="deck";
   const secs=Math.floor((c.ms||0)/1000);
   $("#mTitle").textContent=c.title||c.video_id;
   $("#mMeta").textContent = c.transcript ? `“${c.transcript}”` : `Moment at ${c.timestamp}`;
-  const box=$("#playerBox"); const yid=ytId(c);
+  const box=$("#playerBox"); const yid=isDoc?null:ytId(c);
   // Frame preview if we have one; otherwise (text-only YouTube moment) the
-  // video's thumbnail, so the modal never shows an empty preview.
-  const preview = c.thumbnail || (yid ? `https://img.youtube.com/vi/${yid}/hqdefault.jpg` : null);
+  // video's thumbnail, so the modal never shows an empty preview. Documents
+  // never have a frame — the PDF itself is the "preview" (rendered below).
+  const preview = isDoc ? null : (c.thumbnail || (yid ? `https://img.youtube.com/vi/${yid}/hqdefault.jpg` : null));
   $("#mFrame").style.display = preview ? "" : "none";
   if(preview) $("#mFrame").src = preview;
   const isFrame = !!c.thumbnail;
-  $("#mFrameLabel").textContent = isFrame ? "Matched frame" : "Matched on transcript";
+  $("#mFrameLabel").textContent = isFrame ? "Matched frame" : (isDoc ? "Matched on text" : "Matched on transcript");
   $("#mFrameDesc").textContent = isFrame
     ? "This is what CLIP matched your question against — the still it judged closest to what you asked."
-    : "This moment matched on what was said (transcript). Shown is the video’s thumbnail — press play to jump to the exact spot.";
+    : isDoc
+      ? "This moment matched the document's extracted text. Press play to open the PDF at the matching page/slide."
+      : "This moment matched on what was said (transcript). Shown is the video’s thumbnail — press play to jump to the exact spot.";
   $("#mOut").href=c.deeplink||"#";
-  if(yid){
+  if(isDoc){
+    const src = c.deeplink || c.doc_url || "";
+    box.innerHTML = src
+      ? `<iframe class="w-full h-full bg-white" src="${esc(src)}" title="document"></iframe>`
+      : `<div class="w-full h-full flex items-center justify-center text-muted text-sm p-4 text-center">No preview available for this document.</div>`;
+  } else if(yid){
     box.innerHTML=`<iframe class="w-full h-full" src="https://www.youtube.com/embed/${yid}?start=${secs}&autoplay=1&rel=0"
       title="moment" frameborder="0" allow="autoplay; encrypted-media; picture-in-picture" allowfullscreen></iframe>`;
   } else {

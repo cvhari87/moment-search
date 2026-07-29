@@ -28,20 +28,40 @@ def _seconds(ms: int) -> str:
     return f"{s // 60:02d}:{s % 60:02d}"
 
 
+def _locator(h: dict) -> tuple[str, float | int]:
+    """Bucketing key for one hit. Document chunks carry a page/slide number
+    (set in src/ingest/document.py's t_embed, KIND_SPEC) instead of a
+    timestamp — that number IS their citation target, so two different pages
+    must never merge into one window the way two video frames a few seconds
+    apart genuinely can (they're "the same moment"; page 1 and page 2 are
+    not). Without this, every document chunk fell through to
+    `h.get("ms", 0)` (no ms key on a document payload) = t=0.0 for ALL of
+    them, so every page of a document collapsed into one window keyed on
+    video_id + t=0 and only the single best-rrf chunk survived."""
+    if "page" in h:
+        return ("page", h["page"])
+    if "slide" in h:
+        return ("slide", h["slide"])
+    return ("time", float(h.get("t_start", h.get("ms", 0) / 1000.0)))
+
+
 def _fuse(visual_hits: list[dict], text_hits: list[dict]) -> list[dict]:
-    """Reciprocal-Rank-Fusion of the two branches into time windows.
+    """Reciprocal-Rank-Fusion of the two branches into moment windows.
 
     Raw scores are incomparable (CLIP ~0.3 vs bge ~0.7), so we rank each branch
-    on its own and score by rank: rrf = 1/(RRF_K + rank). Then we bucket hits
-    within FUSION_WINDOW_S seconds of each other (same video) into one 'moment',
-    sum their rrf, and boost windows where BOTH modalities agree — two
-    independent signals pointing at the same instant is the strongest evidence.
+    on its own and score by rank: rrf = 1/(RRF_K + rank). Video hits bucket by
+    proximity (within FUSION_WINDOW_S seconds of each other, same video) into
+    one 'moment'; document hits bucket by EXACT page/slide match instead (see
+    _locator) since there's no timeline to be "close" on. Windows sum their
+    rrf, and boost when BOTH modalities agree — two independent signals
+    pointing at the same instant is the strongest evidence (documents only
+    ever populate the text slot; there is no CLIP frame branch for a PDF).
     """
     def ranked(hits, modality):
         out = []
         for rank, h in enumerate(hits):
-            t = float(h.get("t_start", h.get("ms", 0) / 1000.0))
-            out.append({**h, "modality": modality, "rrf": 1.0 / (RRF_K + rank), "t": t})
+            out.append({**h, "modality": modality, "rrf": 1.0 / (RRF_K + rank),
+                       "loc": _locator(h)})
         return out
 
     windows: list[dict] = []
@@ -49,10 +69,16 @@ def _fuse(visual_hits: list[dict], text_hits: list[dict]) -> list[dict]:
     # a given modality is that modality's best hit there.
     for h in sorted(ranked(visual_hits, "frame") + ranked(text_hits, "text"),
                     key=lambda x: x["rrf"], reverse=True):
-        w = next((w for w in windows if w["video_id"] == h["video_id"]
-                  and abs(w["t"] - h["t"]) <= FUSION_WINDOW_S), None)
+        loc_kind, loc_val = h["loc"]
+        if loc_kind == "time":
+            w = next((w for w in windows if w["video_id"] == h["video_id"]
+                      and w["loc"][0] == "time"
+                      and abs(w["loc"][1] - loc_val) <= FUSION_WINDOW_S), None)
+        else:  # page/slide — exact match only, never proximity-merged
+            w = next((w for w in windows if w["video_id"] == h["video_id"]
+                      and w["loc"] == h["loc"]), None)
         if w is None:
-            w = {"video_id": h["video_id"], "t": h["t"], "rrf": 0.0,
+            w = {"video_id": h["video_id"], "loc": h["loc"], "rrf": 0.0,
                  "modalities": set(), "frame": None, "text": None}
             windows.append(w)
         w["modalities"].add(h["modality"])
@@ -82,6 +108,14 @@ def _deeplink(video: dict | None, video_id: str, ms: int) -> str:
     return f"/api/video/{video_id}#t={secs}"
 
 
+def _doc_deeplink(video: dict | None, user_id: str, doc_id: str,
+                  page: int | None) -> str:
+    url = _doc_url(video, user_id, doc_id) or f"/api/document/{doc_id}"
+    # #page=N is a client-side PDF-viewer fragment, harmless to append to a
+    # presigned query-string URL (fragments never reach the server).
+    return f"{url}#page={page}" if page else url
+
+
 def _thumb_url(user_id: str, video_id: str, idx: int) -> str:
     """Browser-facing thumbnail URL. Presigned GET straight to the bucket when
     the provider supports it (an <img> tag can't send auth headers); the API
@@ -98,6 +132,32 @@ def _media_url(video: dict | None, user_id: str, video_id: str) -> str | None:
     if storage.presign_capable():
         return storage.presign_get(video["storage_key"])
     return f"/api/video/{video_id}?u={user_id}"
+
+
+def _doc_url(video: dict | None, user_id: str, doc_id: str) -> str | None:
+    """Browser-facing PDF URL for a document citation. Prefers our own bytes
+    (storage_key — private, content-addressed, never expires) over `uri`;
+    falls back to `uri` only for URL-registered documents, which never get a
+    storage_key (src/ingest/document.py reads those straight off the source
+    URL instead of a local copy — see docstring there)."""
+    if not video:
+        return None
+    if video.get("storage_key"):
+        if storage.presign_capable():
+            return storage.presign_get(video["storage_key"])
+        return f"/api/document/{doc_id}?u={user_id}"
+    return video.get("uri")
+
+
+def _locator_label(loc: tuple[str, float | int] | None) -> str:
+    """Human-readable citation target: '00:12' for a video moment, 'page 3' /
+    'slide 3' for a document chunk — used both for the UI's timestamp pill
+    and (via _build_moments) the label the LLM sees, so a document moment
+    never renders as a blank/None timestamp."""
+    if loc is None:
+        return ""
+    kind, val = loc
+    return _seconds(int(val * 1000)) if kind == "time" else f"{kind} {val}"
 
 
 def retrieve(question: str, user_id: str, *, top_k: int | None = None,
@@ -132,22 +192,35 @@ def retrieve(question: str, user_id: str, *, top_k: int | None = None,
         vid = w["video_id"]
         meta = videos.get(vid)
         fr, tx = w["frame"], w["text"]
-        # Anchor on the frame's exact timestamp when there is one (precise visual
-        # seek); otherwise the transcript chunk's start.
-        ms = int(fr["ms"]) if fr else int(w["t"] * 1000)
-        idx = int(fr["idx"]) if fr else None
+        loc_kind, loc_val = w["loc"]
+        is_doc = loc_kind in ("page", "slide")
+        if is_doc:
+            # A page/slide number, not a timeline position — there is no
+            # frame, no seekable ms, and the citation resolves to a PDF page
+            # rather than a video timestamp.
+            ms = idx = None
+        else:
+            # Anchor on the frame's exact timestamp when there is one (precise
+            # visual seek); otherwise the transcript chunk's start.
+            ms = int(fr["ms"]) if fr else int(loc_val * 1000)
+            idx = int(fr["idx"]) if fr else None
         citations.append({
             "n": i,
             "video_id": vid,
             "title": (meta or {}).get("title") or vid,
             "url": (meta or {}).get("url"),
             "source": (meta or {}).get("source"),
+            "kind": (meta or {}).get("kind", "video"),
+            "page": loc_val if loc_kind == "page" else None,
+            "slide": loc_val if loc_kind == "slide" else None,
             "ms": ms,
-            "timestamp": _seconds(ms),
+            "timestamp": _locator_label(w["loc"]),
             "idx": idx,
             "thumbnail": _thumb_url(user_id, vid, idx) if idx is not None else None,
-            "media_url": _media_url(meta, user_id, vid),
-            "deeplink": _deeplink(meta, vid, ms),
+            "media_url": None if is_doc else _media_url(meta, user_id, vid),
+            "doc_url": _doc_url(meta, user_id, vid) if is_doc else None,
+            "deeplink": (_doc_deeplink(meta, user_id, vid, loc_val) if is_doc
+                        else _deeplink(meta, vid, ms)),
             "score": round(w["rrf"], 4),
             "transcript": (tx or {}).get("text"),
             "modalities": sorted(w["modalities"]),

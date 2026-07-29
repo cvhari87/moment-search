@@ -176,7 +176,8 @@ def video(video_id: str, u: str | None = None,
         raise HTTPException(404, "Playback streams from object storage.")
     uid = _uid(u)
     row = db.get_video(video_id)
-    if row is None or row["user_id"] != uid or not row.get("storage_key"):
+    if (row is None or row["user_id"] != uid or not row.get("storage_key")
+            or row.get("kind", "video") != "video"):
         raise HTTPException(404, "Video not found.")
     path = storage.local_path(row["storage_key"])
     if not path.exists():
@@ -214,6 +215,26 @@ def video(video_id: str, u: str | None = None,
                              headers={"Content-Range": f"bytes {start}-{end}/{size}",
                                       "Accept-Ranges": "bytes",
                                       "Content-Length": str(length)})
+
+
+@router.get("/api/document/{doc_id}")
+def document(doc_id: str, u: str | None = None):
+    """Local-dev PDF serving for uploaded papers/decks — the storage_key
+    counterpart to /api/video for documents (a real bucket serves these via
+    presigned URLs instead, from src.rag.search._doc_url, and never reaches
+    this route). Kind-checked so a video id can't be requested here either."""
+    if storage.presign_capable():
+        raise HTTPException(404, "Document viewing streams from object storage.")
+    uid = _uid(u)
+    row = db.get_video(doc_id)
+    if (row is None or row["user_id"] != uid or not row.get("storage_key")
+            or row.get("kind") not in ("paper", "deck")):
+        raise HTTPException(404, "Document not found.")
+    path = storage.local_path(row["storage_key"])
+    if not path.exists():
+        raise HTTPException(404, "Document file not found.")
+    return FileResponse(path, media_type="application/pdf",
+                        headers={"Cache-Control": "private, max-age=3600"})
 
 
 @router.get("/corpus/{name}")

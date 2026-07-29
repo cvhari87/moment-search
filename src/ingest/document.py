@@ -6,11 +6,20 @@ pending -> parsing -> chunking -> embedding -> indexed | failed
 Stages:
   1. parse   fetch the PDF into memory (size-capped, magic-byte-checked),
              extract per-page text with real page numbers -> commit
-             docs/{user}/{id}/parsed.json
+             docs/{user}/{id}/{kind}/{_PARSE_VERSION}/parsed.json
   2. chunk   page-aware chunking (never spans two pages — the page number
-             IS the locator) -> commit docs/{user}/{id}/chunks.json
+             IS the locator) -> commit
+             docs/{user}/{id}/{kind}/{_PARSE_VERSION}/chunks.json
   3. embed   text-embed the chunks -> idempotent Qdrant upsert into the SAME
              TEXT_COLLECTION transcript chunks already live in
+
+Checkpoint keys carry `kind` and `_PARSE_VERSION`, not just doc_id: re-
+registering the same bytes (same content-hash doc_id) under a different kind
+must not resume from the other kind's checkpoint (paper pages skip the
+vision-caption branch entirely; reusing them for a deck would silently keep
+raw uncaptioned text), and bumping _PARSE_VERSION is how a change to what
+parsing DOES (like adding that caption branch) invalidates every checkpoint
+written under the old semantics instead of being silently reused forever.
 
 Checkpointing is built in, not retrofitted: each of parse/chunk checks
 storage.exists() for its own artifact FIRST and skips straight to loading it
@@ -62,13 +71,26 @@ _MAX_BYTES = DOCUMENT_FETCH_MAX_MB * 1024 * 1024
 # for decks (not `page`).
 KIND_SPEC = {"paper": "page", "deck": "slide"}
 
+# Bump whenever _parse_pdf's semantics change (e.g. the deck-caption branch
+# added here) so a worker never resumes from a checkpoint written under the
+# OLD semantics — without this, an existing deck's committed parsed.json from
+# before the caption branch existed would be treated as "already done" and
+# the new text-poor-slide captioning would simply never run for it, since
+# _load_checkpoint only regenerates on missing/corrupt/invalid, not stale.
+_PARSE_VERSION = "v2"
 
-def _parsed_key(user_id: str, doc_id: str) -> str:
-    return f"docs/{user_id}/{doc_id}/parsed.json"
+
+def _parsed_key(user_id: str, doc_id: str, kind: str) -> str:
+    # `kind` is part of the identity, not just a column on the row: the same
+    # PDF bytes (same doc_id, content-hash identity) re-registered first as a
+    # paper then as a deck must NOT reuse the paper's parsed.json — paper
+    # pages skip the vision-caption branch entirely, so a deck's checkpoint
+    # under the paper's key would silently carry raw (uncaptioned) text.
+    return f"docs/{user_id}/{doc_id}/{kind}/{_PARSE_VERSION}/parsed.json"
 
 
-def _chunks_key(user_id: str, doc_id: str) -> str:
-    return f"docs/{user_id}/{doc_id}/chunks.json"
+def _chunks_key(user_id: str, doc_id: str, kind: str) -> str:
+    return f"docs/{user_id}/{doc_id}/{kind}/{_PARSE_VERSION}/chunks.json"
 
 
 def doc_prefix(user_id: str, doc_id: str) -> str:
@@ -332,7 +354,7 @@ def t_parse(doc_id: str, user_id: str, uri: str | None, kind: str,
     don't already have those bytes ourselves). Exactly one is set per row
     (src/api/documents.py's _register)."""
     db.set_status(doc_id, "parsing")
-    key = _parsed_key(user_id, doc_id)
+    key = _parsed_key(user_id, doc_id, kind)
     cached = _load_checkpoint(key, _valid_parsed_pages)
     if cached is not None:
         print(f"[parse] {doc_id}: parsed.json already committed — resuming from checkpoint")
@@ -346,9 +368,9 @@ def t_parse(doc_id: str, user_id: str, uri: str | None, kind: str,
 
 
 @task(name="chunk-document")
-def t_chunk(doc_id: str, user_id: str, pages: list[dict]) -> list[dict]:
+def t_chunk(doc_id: str, user_id: str, pages: list[dict], kind: str) -> list[dict]:
     db.set_status(doc_id, "chunking")
-    key = _chunks_key(user_id, doc_id)
+    key = _chunks_key(user_id, doc_id, kind)
     cached = _load_checkpoint(key, lambda d: _valid_chunks(d, max_len=DOCUMENT_MAX_CHUNKS))
     if cached is not None:
         print(f"[chunk] {doc_id}: chunks.json already committed — resuming from checkpoint")
@@ -400,7 +422,7 @@ def ingest_document(doc_id: str, user_id: str, kind: str) -> dict:
         if not uri and not storage_key:
             raise ValueError(f"{doc_id} has no uri or storage_key")
         pages = t_parse(doc_id, user_id, uri, kind, storage_key)
-        chunks = t_chunk(doc_id, user_id, pages)
+        chunks = t_chunk(doc_id, user_id, pages, kind)
         n = t_embed(doc_id, user_id, chunks, kind, uri)
         print(f"[ingest] {doc_id} indexed: {n} chunks (attempt {attempt})")
         return {"doc_id": doc_id, "chunks": n}
