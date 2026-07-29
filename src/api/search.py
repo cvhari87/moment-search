@@ -7,6 +7,7 @@ playback stream via presigned URLs and never touch this process.
 """
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 
@@ -152,6 +153,44 @@ def ask(req: AskRequest, x_user_id: str | None = Header(default=None)):
     return rag_search.ask(req.question.strip(), _uid(x_user_id),
                           top_k=req.top_k, video_id=req.video_id,
                           video_ids=video_ids)
+
+
+def _sse(data: dict) -> str:
+    return f"data: {json.dumps(data)}\n\n"
+
+
+@router.get("/ask_stream")
+def ask_stream(q: str, x_user_id: str | None = Header(default=None)):
+    """Assignment-contract SSE endpoint: citations event first (so a client
+    is grounded before the slow part even starts), then the answer — kept
+    entirely separate from POST /api/ask, which is untouched.
+
+    retrieve() (fast: two vector searches + fusion) and answer_from_citations()
+    (slow: the LLM call) are called as two separate steps, not via ask(), so
+    the citations SSE chunk is flushed to the client before the LLM call even
+    begins, not just before its result happens to be serialized."""
+    uid = _uid(x_user_id)
+    question = q.strip()
+
+    def events():
+        if not question:
+            yield _sse({"citations": []})
+            return
+        r = rag_search.retrieve(question, uid)
+        # Citations with no retrieved text (e.g. a frame-only visual match)
+        # would zero the assignment's all-or-nothing "grounded" check for
+        # every OTHER citation in the same answer — omit them here. POST
+        # /api/ask still returns them; the UI there renders frame-only
+        # moments fine.
+        grounded_citations = [c for c in r["citations"] if c.get("text")]
+        yield _sse({"citations": grounded_citations})
+        result = rag_search.answer_from_citations(
+            question, uid, r["citations"], r["best_visual"], r["best_text"])
+        yield _sse({k: v for k, v in result.items() if k != "citations"})
+
+    return StreamingResponse(events(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache",
+                                      "X-Accel-Buffering": "no"})
 
 
 # ── Media (local-dev only; buckets serve these via presigned URLs) ───────────

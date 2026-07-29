@@ -10,6 +10,7 @@ one free check kills most hallucination risk. Generated answers get their
 from __future__ import annotations
 
 import re
+import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
@@ -146,7 +147,18 @@ def _doc_url(video: dict | None, user_id: str, doc_id: str) -> str | None:
         if storage.presign_capable():
             return storage.presign_get(video["storage_key"])
         return f"/api/document/{doc_id}?u={user_id}"
-    return video.get("uri")
+    uri = video.get("uri")
+    if uri:
+        path = urllib.parse.urlparse(uri).path
+        if path.startswith("/corpus/"):
+            # `uri` here is the ingestion-time fetch target, e.g.
+            # http://api:8000/corpus/deck.pdf — that hostname only resolves
+            # inside the docker-compose network, never in the user's browser.
+            # The path alone (leading "/") is host-relative: it resolves
+            # against whatever origin actually served this citation, which
+            # is the same process that owns the /corpus/{name} route.
+            return path
+    return uri
 
 
 def _locator_label(loc: tuple[str, float | int] | None) -> str:
@@ -204,13 +216,30 @@ def retrieve(question: str, user_id: str, *, top_k: int | None = None,
             # visual seek); otherwise the transcript chunk's start.
             ms = int(fr["ms"]) if fr else int(loc_val * 1000)
             idx = int(fr["idx"]) if fr else None
+        # Evaluator/assignment contract (Assignment3_Plan.md Block F): every
+        # citation carries kind/sourceId/locator/text alongside the existing
+        # video-shaped fields below, which stay untouched so the current UI
+        # keeps working unmodified.
+        if loc_kind == "page":
+            locator: dict[str, Any] = {"page": loc_val}
+        elif loc_kind == "slide":
+            locator = {"slide": loc_val}
+        elif tx and "t_end" in tx:
+            # A real span when the transcript chunk has one; start==end (a
+            # single instant) when all we have is a frame timestamp.
+            locator = {"start_ms": int(tx.get("t_start", loc_val) * 1000),
+                      "end_ms": int(tx["t_end"] * 1000)}
+        else:
+            locator = {"start_ms": ms, "end_ms": ms}
         citations.append({
             "n": i,
             "video_id": vid,
+            "sourceId": vid,
             "title": (meta or {}).get("title") or vid,
             "url": (meta or {}).get("url"),
             "source": (meta or {}).get("source"),
             "kind": (meta or {}).get("kind", "video"),
+            "locator": locator,
             "page": loc_val if loc_kind == "page" else None,
             "slide": loc_val if loc_kind == "slide" else None,
             "ms": ms,
@@ -222,6 +251,7 @@ def retrieve(question: str, user_id: str, *, top_k: int | None = None,
             "deeplink": (_doc_deeplink(meta, user_id, vid, loc_val) if is_doc
                         else _deeplink(meta, vid, ms)),
             "score": round(w["rrf"], 4),
+            "text": (tx or {}).get("text"),
             "transcript": (tx or {}).get("text"),
             "modalities": sorted(w["modalities"]),
         })
@@ -281,11 +311,14 @@ def resolve_llm(user_id: str) -> tuple[llm.LLMConfig | None, str]:
     return (cfg, "server") if cfg else (None, "none")
 
 
-def ask(question: str, user_id: str, *, top_k: int | None = None,
-        video_id: str | None = None,
-        video_ids: list[str] | None = None) -> dict[str, Any]:
-    r = retrieve(question, user_id, top_k=top_k, video_id=video_id, video_ids=video_ids)
-    citations = r["citations"]
+def answer_from_citations(question: str, user_id: str, citations: list[dict[str, Any]],
+                          best_visual: float, best_text: float) -> dict[str, Any]:
+    """The slow half of the read path (LLM call), split out from retrieve()
+    (the fast half) so a caller can act on citations before this runs —
+    /ask_stream (src/api/search.py) emits the citations SSE event right after
+    retrieve() returns, then calls this, so a client sees grounded citations
+    well before the LLM's answer is ready instead of waiting on both together
+    the way POST /api/ask (which just calls ask() below) necessarily does."""
     result: dict[str, Any] = {"question": question, "citations": citations}
 
     if not citations:
@@ -295,8 +328,8 @@ def ask(question: str, user_id: str, *, top_k: int | None = None,
 
     # Gate 1 — confidence on the RAW per-branch bests (not the RRF score).
     # Abstain only if NEITHER what's on screen nor what's said looks relevant.
-    visual_ok = r["best_visual"] >= CONFIDENCE_THRESHOLD
-    text_ok = r["best_text"] >= TEXT_CONFIDENCE_THRESHOLD
+    visual_ok = best_visual >= CONFIDENCE_THRESHOLD
+    text_ok = best_text >= TEXT_CONFIDENCE_THRESHOLD
     if CONFIDENCE_THRESHOLD and not visual_ok and not text_ok:
         result.update(answer=ABSTAIN, llm_used=False, abstained=True)
         return result
@@ -317,3 +350,11 @@ def ask(question: str, user_id: str, *, top_k: int | None = None,
     result["llm_source"] = source          # "user" = their own hosted model
     result["llm_model"] = cfg.model
     return result
+
+
+def ask(question: str, user_id: str, *, top_k: int | None = None,
+        video_id: str | None = None,
+        video_ids: list[str] | None = None) -> dict[str, Any]:
+    r = retrieve(question, user_id, top_k=top_k, video_id=video_id, video_ids=video_ids)
+    return answer_from_citations(question, user_id, r["citations"],
+                                 r["best_visual"], r["best_text"])
