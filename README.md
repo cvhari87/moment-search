@@ -1,57 +1,63 @@
 # MomentSearch
 
-**Ask questions about your videos and get answers grounded in the exact moments — by what's _seen_ on screen, and (for YouTube) what's _said_ in the transcript.**
+**Bring every video, paper, and slide deck into one searchable index. Ask a question in
+plain English and get back the exact moment it lives in — a timestamp, a page, a slide —
+cited, not guessed.**
 
 🌐 **Live app:** [momentsearch.fly.dev](https://momentsearch.fly.dev/get-started) · 🎥 **Demo video:** [watch on Loom](https://www.loom.com/share/d9d10e4ca7c5448eb9ab2a7b6db619f4) — a live walkthrough asking one question across a video, a research paper, and a slide deck, and getting back a single grounded answer with correctly-typed citations (timestamp / page / slide) that deep-link straight to the original source.
 
-I lead this end to end — system architecture, distributed infra, the ML retrieval
-pipeline, and production reliability — the way I expect any engineering leader to:
-hands-on with the code and the incidents, not just the roadmap. It's not a notebook
-demo: it's a multi-tenant system with a real work queue, measured SLAs, and
-crash-recovery guarantees I verified myself by killing a worker mid-job and proving
-nothing was lost.
+Multimodal, agentic RAG, not a search bar: video frames, spoken transcript, and document
+text all land in one shared index behind one query. Two retrieval branches run in
+parallel, get fused by rank, and pass through a confidence gate that decides — before any
+LLM call — whether there's enough evidence to answer at all. It's a full software system:
+an async ingest queue, a fair-scheduling dispatcher, crash-recovery guarantees, and a
+benchmark suite that grades every claim against a script anyone can re-run — including the
+ones that don't pass.
 
 ## At a glance
 
-- **Held to production SLAs, not just demoed.** An automated benchmark suite gates
-  every change against real targets: 0.929 recall@10, 0.788 MRR@6, 0.0% error rate, and
-  **zero data loss under a live worker crash** — verified by killing a worker mid-ingest
-  and confirming checkpoint-resume from the logs. Full evidence in
-  [`PRODUCT_EVAL.md`](PRODUCT_EVAL.md).
+- **Multimodal by design.** Video (CLIP frames), YouTube transcripts (bge text), and
+  documents — PDFs and PowerPoint decks, rendered and chunked — all share one manifest and
+  one retrieval path; a citation always carries a real timestamp, page, or slide, never an
+  invented locator.
+- **Held to production SLAs, not just demoed.** recall@10 0.929, MRR@6 0.788, 0.0% error
+  rate, and **zero data loss under a live worker crash** — verified by killing a worker
+  mid-ingest and confirming checkpoint-resume from the logs. Full evidence in
+  [`PRODUCT_EVAL.md`](PRODUCT_EVAL.md); the one gate still short (ingest throughput) is
+  reported there too, not hidden.
 - **Found, root-caused, and fixed a real distributed-systems bug under load** — a
   cross-environment queue collision that caused silent job failures in production —
   traced from an actual crash traceback, fixed, and re-verified. Written up in full,
   including a plain-English explanation for a non-technical reader, in
   [`LEARNINGS.md`](LEARNINGS.md).
 - **Scaled on the axis that actually matters.** Ingest (cheap, CPU, horizontal) and
-  embedding (expensive, GPU-ready, vertical) are deliberately split into independently
-  scalable services, so a backfill of cheap workers never has to wait on GPU capacity
-  and vice versa.
+  embedding (expensive, GPU-ready, vertical) are split into independently scalable
+  services, so a backfill of cheap workers never waits on GPU capacity, and vice versa.
 - **Multi-tenant from the data model up.** Every row, bucket key, and vector is
-  `user_id`-scoped and filtered; a fair-scheduling dispatcher (weighted round-robin)
-  keeps one heavy user from starving everyone else's queue.
-- **Full-stack ownership:** system design · distributed queue & fair scheduling ·
-  multi-tenant vector search (Qdrant) · multimodal RAG (CLIP + LLM) · Postgres data
-  modeling · object storage · CI/CD to Fly.io · cost-aware infra (stateless compute,
-  rented managed state).
+  `user_id`-scoped and filtered; a fair-scheduling dispatcher (weighted round-robin) keeps
+  one heavy user from starving everyone else's queue.
 
 ## What it does
 
-MomentSearch is an open-source, production-shaped stack for **visual** video
-search and RAG. Users upload videos (or paste YouTube URLs); background workers
-sample keyframes, dedup them, embed them with CLIP and index them per-user in
-[Qdrant](https://qdrant.tech). Ask a question and it retrieves the most
-relevant moments and (optionally) has **your own vision LLM** read those
-frames and write a cited answer — or honestly abstain when the evidence isn't
-there.
+MomentSearch is an open-source, production-shaped multimodal RAG stack. Point it at a
+video, a research paper, or a slide deck — upload directly or paste a URL — and
+background workers parse, chunk, and embed each one into the **same shared index**. Ask a
+question and it retrieves across all of them in parallel, fuses what's on screen with
+what's said and what's written, and (optionally) has **your own vision LLM** read the
+evidence and write a cited answer — or honestly abstain when it isn't there. It doesn't
+matter what kind of content the answer lives in; the system finds the moment and proves it
+with a locator, not a guess.
 
-> **Visual-first, multimodal for YouTube.** The core is *visual* — CLIP over
-> sampled frames, so it works on silent footage, screen recordings, sports,
-> b-roll, slides, demos: anything you can *see*. For **YouTube** it adds a
-> **transcript** branch (captions) and fuses the two, so "find where they *talk
-> about* X" works too. **Uploaded files are visual-only for now** — no audio
-> transcription yet (that'd need Whisper).
+> **Within video: visual-first, multimodal for YouTube.** The core signal for video is
+> *visual* — CLIP over sampled frames, so it works on silent footage, screen recordings,
+> sports, b-roll, slides, demos: anything you can *see*. For **YouTube** it adds a
+> **transcript** branch (captions) and fuses the two, so "find where they *talk about* X"
+> works too. **Uploaded video files are visual-only for now** — no audio transcription yet
+> (that'd need Whisper). Papers and decks are handled as text from the start.
 
+- 📄 **Multi-source ingestion** — video, YouTube URLs, PDFs, and PowerPoint decks all
+  register through the same API and land in the same index, with a correctly-typed
+  locator (timestamp / page / slide) on every citation
 - 🎥 **Presigned uploads** — the browser PUTs straight to object storage; gigabytes never flow through the API
 - ⚙️ **Queue + stateless workers** — the API answers `202` instantly; Prefect-orchestrated workers do the heavy lifting
 - 🔍 **Visual retrieval** — CLIP embeddings, runs locally, no API key needed to search
