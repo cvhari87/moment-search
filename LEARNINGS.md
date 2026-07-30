@@ -1412,6 +1412,132 @@ not both — CLIP's visual similarity on this corpus doesn't discriminate by rel
 signal. When adding a confidence check to a multi-signal fusion step, check whether each signal is
 actually discriminative on your data before assuming symmetric treatment is correct.
 
+## The resilience and error-rate bug, explained without jargon
+
+This section tells the same story as the two technical entries that follow it, but assumes no
+technical background. It uses the library analogy from the top of this document — front desk,
+master ledger, fair line manager, job supervisor, processing team, warehouse, card catalog — so if
+any of those terms are unfamiliar, that section explains them first.
+
+### The setup nobody had thought all the way through
+
+This library isn't one building. It's two: a small local branch (the laptop this was developed on)
+and a permanent public branch (the copy running on Fly.io that anyone can visit at its website).
+That's normal and intentional — most real systems run a "development" copy and a "production" copy
+side by side.
+
+But these two branches were built to **share things** on purpose. They share the same master
+ledger (one database, recording every item the library owns and how far along its processing is).
+They share the same job supervisor (one service that hands out work and tracks who's doing what).
+That sharing is a real feature: if you register a new paper or video at the local branch, someone
+visiting the public branch's website can immediately search for it too, because both branches are
+reading from the same ledger and the same catalog.
+
+What the two branches do **not** share is their warehouse. The local branch keeps its raw uploaded
+files on the laptop's own hard drive. The public branch keeps its raw uploaded files in a completely
+separate cloud storage locker, because a laptop's hard drive isn't something the public internet can
+reach. Two branches, two separate warehouses, physically nothing in common — but one shared ledger
+and one shared job supervisor sitting on top of both of them.
+
+Nobody had written down a rule for what should happen when a job shows up on the shared to-do list:
+"whichever branch's processing team is free first gets to grab it." That sounds reasonable until you
+notice the missing question — free to grab it, sure, but is that team's warehouse the one that
+actually has the item's physical materials in it?
+
+### The test that exposed it
+
+To prove the system is trustworthy, one of the checks is: what happens if a member of the
+processing team collapses mid-task — the process running their work gets forcibly killed, as if
+someone tripped over a power cord? A well-built system should notice, hand the abandoned job to
+someone else, and pick it back up roughly where it left off, not lose it and not restart it wastefully
+from page one.
+
+Running that test kept failing. Some jobs came back finished, but a few came back with an error that,
+translated out of its technical wording, says roughly: **"we went to our warehouse to get this item's
+materials, and they weren't there."** That is a scary-sounding error — it's the kind of message you'd
+expect to see if a file had genuinely been deleted or corrupted.
+
+Except the materials hadn't been deleted. Someone checked, by hand, right after a failure: walked
+into the warehouse that had supposedly lost the file, and asked for it directly. It was there, intact,
+handed over immediately. So the error message was, in a real sense, *lying by implication* — it
+sounded like "your file is gone" when what had actually happened was "the wrong team looked in the
+wrong warehouse."
+
+### Finding out which team actually did the work
+
+Here is where the two shared systems mentioned earlier — the shared job supervisor — became useful
+for solving the mystery, not just for running the library. Every job the job supervisor hands out
+gets a paper trail: a full record of exactly which step of the work ran, in order, right up until
+the moment it failed. That record is kept centrally, so it can be pulled up regardless of which
+branch's team actually did the work.
+
+Pulling up the paper trail for one of the failed jobs answered the question directly, instead of by
+guesswork: the very last thing recorded, right before the failure, was a step that — by design — only
+ever runs when a processing team is about to reach into the *cloud* warehouse, never the *local* one.
+That's the smoking gun. It proves, in black and white, that the public branch's processing team had
+picked up a job for a file that only ever existed in the local branch's warehouse. Of course they
+came back empty-handed. They were never going to find it — they were looking in the wrong building
+entirely.
+
+(An earlier attempt to explain this same failure had checked something adjacent — "were all the
+processing teams we personally started for this experiment pointed at the local warehouse?" — and
+concluded yes, so this couldn't be the shared-warehouse problem. That check was too narrow: it only
+counted the teams deliberately started *for the experiment*. It didn't account for the fact that the
+public branch's own processing team is *always* running in the background, day and night, whether or
+not anyone is thinking about it during a local test. The paper trail settled it more directly than
+that earlier reasoning could.)
+
+### Why this also explains the "25% of jobs failed" problem
+
+A separate-looking number from the same round of testing — one in four newly-registered documents
+either erroring out or getting permanently stuck — turned out to be the exact same story wearing a
+different hat. Those documents weren't victims of a parsing bug or a broken chunk of processing
+logic. They were simply being grabbed by whichever branch's team happened to be free first, and when
+that happened to be the wrong branch, the job could never have been completed no matter how well the
+rest of the code worked — it wasn't a matter of trying harder, the required materials were physically
+unreachable from where that team was standing. Once the underlying mistake was fixed, this number
+dropped to zero on the very next real test, without anyone touching the actual document-processing
+code at all — further proof it had never been a processing bug in the first place.
+
+### The fix, in plain terms
+
+Two changes were needed, not one, because there were two separate moments where the wrong team could
+end up grabbing a job:
+
+1. **When a brand-new job is first handed out**, each branch's job supervisor now only offers work to
+   its own processing team, by name — the local branch's supervisor only calls the local team, the
+   public branch's supervisor only calls the public team.
+2. **When an abandoned job gets reset and put back on the to-do list** (the recovery step that runs
+   after a team member "collapses" mid-task), the to-do list itself now records which warehouse each
+   item's materials actually live in, and every team — local or public — was taught to skip over any
+   item on the list that isn't tagged for their own warehouse, even if they'd otherwise be free to
+   take it.
+
+The first fix alone was tried first and looked sufficient, but wasn't — it only closed off the first
+moment. The second moment (an abandoned job being reset and re-offered to whichever team happens to
+ask next) was still wide open, and testing found that out rather than assuming the first fix had
+covered everything.
+
+### How we know it's actually fixed, not just declared fixed
+
+The same "collapse a team member mid-task" experiment was run again afterward, against the corrected
+system, and this time all ten test documents came back fully processed, with the paper trail
+explicitly confirming that the interrupted ones picked up from where they'd left off rather than
+starting over. The one-in-four failure rate from before measured at zero on that same re-run. Neither
+result was assumed from reading the fix's description — both were re-created and watched happen,
+because a bug this subtle (a scary-looking "file is lost" error that was really a "wrong team showed
+up" error) is exactly the kind of thing that's easy to mark "fixed" on paper without it actually being
+fixed everywhere the mistake could still happen.
+
+### The general lesson, for anyone building something similar
+
+Whenever two systems are deliberately set up to share one waiting list or one ledger, but do **not**
+share everything sitting behind that ledger, "who's allowed to see a job" and "who's allowed to *do*
+a job" are two different questions — and only the first one gets answered for free just by sharing
+the list. The second one has to be designed on purpose, checked at every point a job can be handed
+out (not just the obvious first one), and re-tested by actually reproducing the failure, not just by
+reasoning about whether the fix should have worked.
+
 ## A shared queue across environments needs environment affinity, not just a shared schema
 
 Local dev and the Fly deployment were designed to share state on purpose — one Neon manifest, one
@@ -1471,6 +1597,58 @@ play at all" is exactly the precondition that differed, and checking it directly
 run's `STORAGE_PROVIDER` value) was cheaper and more conclusive than reasoning from the matching
 traceback. Claiming a fix resolved a regression it merely resembles is a worse outcome than not
 fixing the regression yet, because it closes the investigation on a still-open bug.
+
+**Correction, found later — the elimination check above was itself wrong, for the reason the entry
+warns about.** "`STORAGE_PROVIDER=local` for every container involved" only checked the containers
+this test explicitly spun up (the local docker-compose stack). It did not — could not, from that
+vantage point — see that the Fly deployment was independently alive against the SAME shared Prefect
+Cloud workspace and Postgres manifest, and therefore was also "involved" whether or not this
+experiment intended it to be. Pulling the actual Prefect Cloud run for the failing doc_id
+(`doc_9e69d7212490`) settled it directly: the traceback shows `storage.py`'s S3 branch
+(`_s3().get_object(...)`) executing, which is only reachable when the executing process's OWN
+`STORAGE_PROVIDER` is not `"local"` — meaning a Fly worker, not a local one, ran this task. Block K's
+`--resilience` FAIL and the collision fix WERE the same bug; see the next entry for the confirmed
+root cause and re-verification.
+
+The lesson this adds, not replaces: "check the precondition directly instead of trusting the
+matching traceback" is correct, but a precondition check is only as good as its own scope — "every
+container involved" quietly meant "every container I set up for this test," which is a narrower
+claim than it reads as when two environments share a live coordination layer. When a system is
+DESIGNED to have two independent deployments sharing one queue/database (as this one is), a
+same-environment assumption needs to be verified against the shared resource itself (here: which
+process actually ran the task, per its own traceback) — not against the guest list of what one
+side deliberately started.
+
+## The actual root cause of the resilience and error-rate failures: a cross-environment queue collision, not a checkpoint bug
+
+Both numbers `PRODUCT_EVAL.md` originally reported as failing — `no_loss_under_crash: False` and a
+25% error rate on a 20-document backfill — traced to the same single mechanism, confirmed via the
+live Prefect Cloud run logs rather than inferred: local dev and the Fly deployment share one Prefect
+Cloud workspace and one Neon Postgres manifest (by design, so a source registered in either place is
+searchable from both), but have incompatible storage backends — local disk vs. Fly's Tigris/S3
+bucket. Until commit `a2623de`, nothing enforced that a dispatcher could only claim rows whose bytes
+its OWN environment could reach: `db.claim_pending()`'s admission query and Prefect's deployment
+names were both environment-agnostic, so a stale row (reset to `pending` by the reconciler after a
+local worker crash) was just as claimable by the Fly worker as by the local one. When Fly won that
+race, its worker tried to fetch a locally-uploaded document's bytes from its own Tigris bucket,
+which had never received them, and raised a genuine `botocore.errorfactory.NoSuchKey` — not because
+any bytes were lost (a manual `storage.get_bytes()` call against the local container, after the
+fact, returned the file immediately), but because the wrong environment's worker was executing the
+task at all. The same mechanism explains the error rate: documents that "failed" or sat stuck
+weren't hitting a real ingest defect, they were being claimed and orphaned by an environment that
+could never have completed them.
+
+The fix closed both admission points this needed (deployment names suffixed by
+`config.DEPLOYMENT_ENV` so a dispatcher's own workers execute what it schedules, plus a `storage_env`
+column filtered into the claim query so a dispatcher can never claim a row pinned to another
+environment's storage) — and was re-verified live in a later session, not just trusted from the
+commit message: a fresh `--resilience` run came back 10/10 indexed, 0 failed, checkpoint-resume
+explicitly confirmed from the worker logs, and the same backfill's error rate measured 0.0%, down
+from 25%. The generalizable lesson, distinct from the entry above: when a bug's proposed root cause
+and its proposed fix are described in a commit message, "verify the fix landed" and "verify the fix
+was pushed to every environment the bug could occur in" are separate checks — a local-only
+re-verification would have looked identical whether or not the same collision could still happen on
+a stale Fly deployment that hadn't picked up the fix yet.
 
 ## An eval metric can be blind to exactly the regression it should catch
 
