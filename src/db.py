@@ -41,6 +41,7 @@ CREATE TABLE IF NOT EXISTS ms_videos (
     source       TEXT NOT NULL,              -- youtube | upload
     url          TEXT,                       -- YouTube URL (source=youtube)
     storage_key  TEXT,                       -- uploads/<user>/<id>.<ext> (source=upload)
+    view_storage_key TEXT,                   -- browser-viewable derivative (e.g. converted PPTX PDF)
     source_hash  TEXT,                       -- sha256 of the file / yt video id
     title        TEXT,
     status       TEXT NOT NULL DEFAULT 'pending',
@@ -76,6 +77,7 @@ CREATE TABLE IF NOT EXISTS ms_user_llms (
 ALTER TABLE ms_videos ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'video';
 ALTER TABLE ms_videos ADD COLUMN IF NOT EXISTS uri TEXT;
 ALTER TABLE ms_videos ADD COLUMN IF NOT EXISTS chunk_count INT;
+ALTER TABLE ms_videos ADD COLUMN IF NOT EXISTS view_storage_key TEXT;
 CREATE INDEX IF NOT EXISTS ms_videos_kind_idx ON ms_videos (kind);
 
 -- Crash-safety reconciler (Block G): a lease token bumped on every admission
@@ -109,6 +111,74 @@ def init_schema() -> None:
     with pool().connection() as conn:
         conn.execute("SELECT pg_advisory_xact_lock(%s)", (_SCHEMA_LOCK_KEY,))
         conn.execute(SCHEMA)
+    backfill_pptx_view_storage_keys()
+
+
+def backfill_pptx_view_storage_keys() -> int:
+    """Populate viewer keys for PPTX decks indexed before Block M's manifest
+    column existed.
+
+    A deck row alone does not prove its source was PPTX (PDF decks use the
+    same kind), so this migration cannot safely reconstruct keys with a blind
+    SQL update. Probe the deterministic conversion checkpoint and validate
+    its bounded bytes before persisting it. The conditional UPDATE makes this
+    idempotent when API and worker processes start concurrently.
+    """
+    # Lazy imports keep the DB module independent of object-storage clients at
+    # import time and avoid adding their optional provider SDKs to schema-only
+    # callers until the migration actually has candidates to inspect.
+    from . import storage
+    from .config import DOCUMENT_MAX_CONVERTED_MB
+    from .ingest.detect import converted_pdf_key
+
+    with pool().connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, user_id, kind
+            FROM ms_videos
+            WHERE kind = 'deck'
+              AND status = 'indexed'
+              AND view_storage_key IS NULL
+            """
+        ).fetchall()
+
+    if not rows:
+        return 0
+
+    max_bytes = DOCUMENT_MAX_CONVERTED_MB * 1024 * 1024
+    backfilled = 0
+    for row in rows:
+        key = converted_pdf_key(row["user_id"], row["id"], row["kind"])
+        try:
+            meta = storage.head(key)
+            size = int(meta.get("size", 0)) if meta is not None else 0
+            if size <= 0 or size > max_bytes:
+                continue
+            data = storage.get_bytes(key)
+            if len(data) > max_bytes or not data.startswith(b"%PDF"):
+                continue
+        except Exception as exc:
+            print(f"[schema] could not verify legacy PPTX derivative {key}: "
+                  f"{type(exc).__name__}: {exc}")
+            continue
+
+        with pool().connection() as conn:
+            result = conn.execute(
+                """
+                UPDATE ms_videos
+                SET view_storage_key = %s, updated_at = now()
+                WHERE id = %s
+                  AND kind = 'deck'
+                  AND status = 'indexed'
+                  AND view_storage_key IS NULL
+                """,
+                (key, row["id"]),
+            )
+            backfilled += max(result.rowcount, 0)
+
+    if backfilled:
+        print(f"[schema] backfilled {backfilled} legacy PPTX viewer key(s)")
+    return backfilled
 
 
 def upsert_pending(video: dict[str, Any]) -> dict:
@@ -148,6 +218,8 @@ def upsert_pending(video: dict[str, Any]) -> dict:
                              THEN ms_videos.error ELSE NULL END,
                 progress = CASE WHEN ms_videos.status = ANY(%(inflight)s)
                                 THEN ms_videos.progress ELSE NULL END,
+                view_storage_key = CASE WHEN ms_videos.status = ANY(%(inflight)s)
+                                        THEN ms_videos.view_storage_key ELSE NULL END,
                 updated_at = now()
             RETURNING *
             """,
@@ -160,6 +232,7 @@ def set_status(video_id: str, status: str, *, error: str | None = None,
                title: str | None = None, frame_count: int | None = None,
                source_hash: str | None = None, embed_version: str | None = None,
                progress: float | None = None, chunk_count: int | None = None,
+               view_storage_key: str | None = None,
                generation: int | None = None) -> None:
     """`generation`, when passed, is the lease token (see SCHEMA's comment on
     the column) a flow run was admitted under — the write becomes a no-op if
@@ -200,6 +273,7 @@ def set_status(video_id: str, status: str, *, error: str | None = None,
                 embed_version = COALESCE(%(embed_version)s, embed_version),
                 progress = %(progress)s,
                 chunk_count = COALESCE(%(chunk_count)s, chunk_count),
+                view_storage_key = COALESCE(%(view_storage_key)s, view_storage_key),
                 updated_at = now()
             WHERE id = %(video_id)s
               AND (status != 'indexed' OR %(status)s = 'pending')
@@ -207,7 +281,8 @@ def set_status(video_id: str, status: str, *, error: str | None = None,
             """,
             {"status": status, "error": error, "title": title, "frame_count": frame_count,
              "source_hash": source_hash, "embed_version": embed_version, "progress": progress,
-             "chunk_count": chunk_count, "video_id": video_id, "generation": generation},
+             "chunk_count": chunk_count, "view_storage_key": view_storage_key,
+             "video_id": video_id, "generation": generation},
         )
 
 

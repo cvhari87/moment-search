@@ -690,6 +690,146 @@ clear-margin pass is stronger than reverting to an equally-unvalidated older num
   `replicas x WORKER_CONCURRENCY` — done; both replicas' dispatcher logs confirmed identical
   `max in-flight` matching the formula, and both were observed claiming backfill documents across
   the Block I runs above.
+- [x] **Block M:** native PPTX ingestion — done, verified live end-to-end, not just unit-tested.
+  - `src/ingest/detect.py`: a new, deliberately lightweight module (stdlib + `src/storage.py`, no
+    prefect) — `sniff_document_kind()` structurally validates PDF (`%PDF` magic bytes) or PPTX
+    (zip magic bytes, PLUS a real `ppt/presentation.xml` part AND a `[Content_Types].xml` entry
+    naming it a presentation — not just any zip, which would let a spoofed `.docx`/`.xlsx` through).
+    It's its own module rather than living in `src/ingest/document.py` (which imports prefect at
+    module scope) specifically so `src/api/documents.py` (upload validation) and `src/rag/search.py`
+    (citation URLs, below) can both use it without dragging prefect into the API process.
+  - `src/ingest/document.py`'s `t_parse`: after fetching bytes (upload or URL), sniffs PDF vs PPTX.
+    A PPTX is converted to PDF via `soffice --headless --convert-to pdf` (`_convert_pptx_to_pdf`,
+    isolated `-env:UserInstallation` profile per call — concurrent flow-run subprocesses,
+    `WORKER_CONCURRENCY > 1`, would otherwise lock-contend on LibreOffice's shared default profile)
+    BEFORE the existing pymupdf extraction runs — completely unchanged downstream: chunking, the
+    slide locator, vision-captioning, checkpointing all reuse the identical code path a
+    hand-exported PDF already went through. The converted PDF is checkpointed SEPARATELY
+    (`converted.pdf`, committed before `parsed.json`), which buys a specific, bounded guarantee —
+    stated precisely because an earlier version of this document overclaimed it (caught in review):
+    a crash ANYWHERE PAST a completed conversion (during pymupdf extraction, during vision
+    captioning of text-poor slides, during chunk/embed, or a Prefect-level retry of the whole
+    task) does not pay LibreOffice's cost again. A crash DURING conversion itself necessarily
+    reconverts — the checkpoint is written after `soffice` returns, so there is nothing to resume
+    from, and resuming a half-written PDF would be worse than redoing it.
+    Both halves verified live, not asserted:
+    - *Crash past conversion:* deleted a real document's `parsed.json` (keeping `converted.pdf`),
+      re-ran `t_parse` — printed "already committed — skipping LibreOffice conversion", finished in
+      0.6s with no soffice subprocess spawned, byte-identical extracted text.
+    - *Crash during conversion:* ran `t_parse` on a real deck in a thread and `SIGKILL`ed the
+      `soffice` child process mid-flight. Result: `PermanentDocumentError` (fails safely, no silent
+      success), **no `converted.pdf` and no `parsed.json` left behind** (no corrupt partial
+      checkpoint that would poison every later retry), and an immediately following retry converted
+      and parsed cleanly to all 3 pages with both checkpoints then present. That's the honest
+      guarantee: fail-safe and idempotent-on-retry, not resume-mid-conversion.
+  - **Found and fixed a gap the initial implementation missed**: a PPTX upload's `storage_key`
+    correctly stays pointed at the ORIGINAL `.pptx` bytes (conversion happens at parse time, not
+    upload time) — but `src/rag/search.py`'s `_doc_url` and `src/api/search.py`'s
+    `/api/document/{id}` both serve citations straight from `storage_key`, which would hand a
+    browser raw `.pptx` bytes labeled `application/pdf` (or presigned with no label at all) — not
+    renderable in the citation iframe. Fixed with `detect.viewer_storage_key()`: swaps in the
+    `converted.pdf` checkpoint for VIEWING whenever one exists, leaving `storage_key` itself
+    untouched. Verified live: `/api/document/{id}` for a real uploaded `.pptx` deck returns
+    `Content-Type: application/pdf`, and the file is a genuine 3-page PDF (`file` command
+    confirms), not the original pptx.
+  - `Dockerfile`: added `libreoffice-impress` (not the full `libreoffice` metapackage — pulls in
+    just the Impress filter + `libreoffice-core`'s `soffice` binary, not Writer/Calc/Draw's own
+    filters this feature never uses).
+  - `ui/index.html`: the upload file picker was hardcoded `accept="application/pdf,.pdf"` — a
+    `.pptx` wouldn't even appear in the browser's file dialog. Widened the accept list and updated
+    the help text and empty-file error message.
+  - Live verification, full loop: built a real 3-slide `.pptx` (python-pptx, in an isolated scratch
+    venv — not a project dependency) with distinct per-slide sentinel text, uploaded it through the
+    running API, confirmed it indexed (3 chunks, one per slide), asked a question whose answer only
+    exists on slide 3, and got back citation `slide: 3` with the exact sentinel text, a correct
+    `deeplink` (`/api/document/{id}#page=3`) pointing at the converted PDF, and a correct LLM
+    answer quoting it — then confirmed a spoofed "renamed .txt as .pptx" upload is rejected 415.
+  - Added `tests/test_block_m_pptx.py` (40 stdlib-unittest tests, no live stack, no real soffice —
+    mocked `subprocess.run`): `sniff_document_kind`'s real PDF/PPTX fixtures plus the spoofing cases
+    (docx-shaped zip, missing presentation part, missing `[Content_Types].xml`, corrupt zip),
+    `_convert_pptx_to_pdf`'s success/failure/timeout/no-output-file paths and per-call profile
+    isolation, `t_parse`'s convert-vs-skip checkpoint branches (via `t_parse.fn`, Prefect's escape
+    hatch to the undecorated function — no engine/flow context needed), and `viewer_storage_key`.
+    Mutation-verified (disabling the presentation-part check made the right test fail).
+
+  **Second guardrail review round found four more real issues** in the above — all fixed, all
+  re-verified live (not just re-tested):
+  1. `sniff_document_kind`'s PPTX check was a byte-substring search
+     (`b"presentationml.presentation" in content_types`) over `[Content_Types].xml`'s raw bytes,
+     not real validation — a crafted archive containing that string ANYWHERE (a comment, an
+     unrelated part's declaration) passed without actually mapping `/ppt/presentation.xml` to a
+     presentation content type. The same unbounded `zf.read("[Content_Types].xml")` was also a zip-
+     bomb vector: a small archive with one wildly-compressed entry at that name could exhaust memory
+     decompressing it. Fixed: real XML parsing (`_content_types_names_presentation`, `ElementTree`,
+     checks the actual `<Override PartName="/ppt/presentation.xml">` mapping) plus a zip-bomb guard
+     (`_zip_bomb_guard` — rejects on the zip directory's own declared sizes, before decompressing
+     anything) and a hard size cap on the one entry actually read.
+  2. `viewer_storage_key` returned `None` immediately whenever `storage_key` was `None` — true for
+     URL-registered documents, which have no `storage_key` at all. But a URL-registered `.pptx` gets
+     converted and checkpointed by `t_parse` exactly the same way an uploaded one does; the early
+     return meant its citation always fell through to the ORIGINAL external `.pptx` URL, never
+     checking whether a converted PDF existed. Fixed by removing the early return — the function now
+     always checks for the checkpoint first, `storage_key`'s nullness only matters as the fallback.
+     Also had to loosen `/api/document/{id}`'s entry guard (`src/api/search.py`), which previously
+     404'd immediately when `storage_key` was falsy — a URL-registered PPTX's converted PDF lives in
+     OUR OWN storage regardless.
+  3. The upload UI defaulted to kind="Paper", and nothing server-side corrected it — a normal PPTX
+     upload (the common case, no kind selected) produced "page N" citations instead of "slide N".
+     Fixed server-side (`_enforce_kind_for_sniffed_type` in `src/api/documents.py`): a sniffed pptx
+     always registers as `kind="deck"` regardless of what was requested; a sniffed PDF keeps the
+     user's real choice. Also auto-selects "Deck" in the UI dropdown on `.pptx` file selection so the
+     visible choice doesn't contradict what the server enforces anyway.
+  4. This document previously claimed "a worker killed mid-conversion doesn't pay LibreOffice's cost
+     again" and cited a test that only proved the WEAKER claim (crash AFTER conversion completes).
+     Corrected above with the real, narrower guarantee, and backed by an ACTUAL mid-conversion kill:
+     ran `t_parse` in a thread and `SIGKILL`ed the `soffice` child process while it was actively
+     converting. Confirmed `PermanentDocumentError` (fails safely), zero partial/corrupt checkpoint
+     left behind, and a clean subsequent retry converts and parses correctly.
+  - Follow-up also addressed: `_convert_pptx_to_pdf` now validates its own output is real PDF bytes
+    (`%PDF` magic) before returning — a `soffice` exit-0-but-garbage-output can no longer get
+    checkpointed as if valid — and `t_parse`'s checkpoint READ path revalidates the same way
+    (mirrors `_load_checkpoint`'s existing revalidate-on-read principle for the JSON artifacts,
+    which `converted.pdf` — raw bytes, not JSON — had no equivalent guard for).
+  **Third guardrail review round (external) found two more P1s, both fixed**:
+  1. `_content_types_names_presentation`'s content-type comparison was `startswith()` against the
+     presentation type with its `.main+xml` suffix stripped — a crafted `[Content_Types].xml`
+     declaring e.g. `...presentationml.presentation.evil` satisfied the prefix and was accepted as a
+     real pptx. Fixed: exact equality against `_PRESENTATION_CONTENT_TYPE`.
+  2. `_enforce_kind_for_sniffed_type` only runs on the upload path (`src/api/documents.py`), which
+     has the bytes in hand at registration time; a URL registration (`POST /admin/documents`) can't
+     sniff a `uri` until `t_parse` actually fetches it, so a document registered `kind="paper"` whose
+     URL happened to serve a `.pptx` sailed through the conversion branch under the wrong kind —
+     wrong "page N" locators, and `converted.pdf`/`parsed.json` checkpointed under `kind=paper`'s
+     namespace instead of `kind=deck`'s. Fixed in `t_parse` itself: reject with
+     `PermanentDocumentError` the moment the fetched bytes sniff as `pptx` but the row's `kind` isn't
+     `deck`, before any checkpoint write.
+  - Also corrected `Assignment3_Plan.md`'s Block M exit criterion, which literally read "killing the
+    worker mid-conversion and restarting doesn't reconvert" — the ACTUAL, tested guarantee is the
+    opposite of that for in-flight work: a *committed* `converted.pdf` is skipped on resume, but a
+    crash mid-conversion (before that commit) safely reconverts from scratch rather than resuming a
+    partial file. Reconversion cost is paid at most once per crash, not eliminated.
+  - Follow-up P2s from the same round, also addressed: (a) `viewer_storage_key`'s
+    `storage.exists(conv_key)` — previously called on every document citation regardless of kind,
+    even though a converted PDF can structurally only ever exist for a PPTX-sourced deck — now skips
+    the storage round-trip entirely for papers and plain-PDF decks (`storage_key` not ending in
+    `.pptx`), which is the common case; (b) `t_parse`'s PPTX branch now rejects a converted deck over
+    `DOCUMENT_MAX_CONVERTED_PAGES` (default 500) BEFORE `_parse_pdf` runs, so a deck with a
+    pathological slide count can't burn vision-captioning LLM calls on every slide before
+    `DOCUMENT_MAX_CHUNKS` would eventually have caught it post-parse.
+  **Final Block M P2 hardening**:
+  - Added `DOCUMENT_MAX_CONVERTED_MB` (default 100). New LibreOffice output is checked with
+    `stat()` before `read_bytes()`, and an existing `converted.pdf` is checked with object-storage
+    metadata before `get_bytes()`. The cap therefore protects worker memory, rather than detecting
+    an oversized file only after it has already been loaded.
+  - Wrapped converted-PDF page-table inspection as `PermanentDocumentError`. A corrupt derivative
+    now skips Prefect's 30s/120s retries because the same fixed bytes cannot repair themselves.
+  - Added `ms_videos.view_storage_key`. Ingestion records the validated converted PDF there;
+    citation rendering now chooses `view_storage_key` or the original `storage_key` using only the
+    manifest row. This removes the remaining S3/GCS `HEAD` request from every PPTX citation.
+  - Documented the conversion timeout, converted-byte cap, and converted-page cap in `.env.example`,
+    with focused regression coverage for each new failure boundary.
+  - Final verification: Block M 40/40, complete repository suite 80/80, benchmark suite 17/17;
+    `git diff --check` and Python compilation also passed.
 - [ ] **Block J:** create or select the permanent Fly app and update both `fly.toml`'s `app` value
   and `CLIP_SERVICE_URL` to the same app name.
 - [ ] **Block J:** verify the intended GitHub deployment branch after `fly launch`; it may rewrite
@@ -701,3 +841,81 @@ clear-margin pass is stronger than reverting to an equally-unvalidated older num
   also change its `doc_id` (expected; see Block H's register-and-capture design above).
 - [ ] Minor, deferred: per-slide caption checkpointing and independent verification of the
   `c2af9c7` legacy-row migration (see guardrail review above).
+
+## 2026-07-29 — UI fix: no discoverable path to the upload flow from the sample page
+
+Status: **complete**
+
+User pointed out that `/get-started` (the upload/bring-your-own-videos UI) was reachable only via
+small hero text below the search examples on the sample page (`/`) — easy to miss, especially since
+that page otherwise reads as read-only. Added a persistent "Get started →" button to the header,
+always visible without scrolling; hidden automatically on `/get-started` itself, using the same
+`applyMode()` toggle the existing hero-text link already relies on, so both stay in sync without a
+second source of truth for which mode is active. Rebuilt and restarted the `api` container;
+confirmed the button renders in the sample page's header and links correctly. Commit `4dcf836`,
+pushed to `feat/multi-source-ingestion`.
+
+## 2026-07-29 — Bug: YouTube auto-caption filler tags corrupting cross-modal ranking
+
+Status: **complete**
+
+User reported that searching "trust" ranked a video moment first whose transcript was just
+`[Music] [Music] [Music]` — visually and semantically unrelated to the query. Diagnosed live against
+the actual branch scores rather than guessed: the visual (CLIP) branch found a frame at 20:22
+scoring 0.2321; the text branch separately surfaced a `[Music]` filler chunk at ~20:14-20:25 scoring
+0.5836 — individually a weak match, well below `TEXT_CONFIDENCE_THRESHOLD`. `_fuse()`'s
+`CROSS_MODAL_BOOST` doesn't check whether the paired text hit is ITSELF a confident match, only that
+a frame and a text hit exist within `FUSION_WINDOW_S` (15s) of each other on the same video — so an
+unrelated frame and a meaningless `[Music]` caption artifact coincidentally "confirmed" each other
+and outranked the one transcript passage that genuinely discusses trust (best text-branch rank,
+0.6889, but with no nearby frame to pair with, so no boost).
+
+Root cause: `src/ingest/transcript.py`'s `_parse_json3` indexed YouTube's non-speech auto-caption
+event tags (`[Music]`, `[Applause]`, etc.) as if they were real spoken content — nothing filtered
+them before chunking/embedding. Fixed: a cue that is ONLY bracket tags is dropped before it ever
+reaches `chunk_cues`/embedding (`_NON_SPEECH_CUE_RE`); a bracket tag alongside real words is left
+untouched. Added `tests/test_transcript_filter.py` (6 tests): music-only and mixed-bracket cues
+dropped, real speech kept, a tag-plus-speech cue kept, and an end-to-end "dead air produces zero
+chunks" case.
+
+The fix only prevents this going forward — it doesn't retroactively clean already-indexed data.
+Purged the 64 stale text-branch chunks for the affected sample video (`yt_l7al3WHQdvg`, "The Hard
+Part of AI") directly from Qdrant and re-ran `t_transcript` under the fixed code, leaving its
+already-correct CLIP frame index untouched (no need to re-download/re-sample the video) — 62 chunks
+came back, zero `[Music]`-only among them. Verified live: `/api/ask` for "trust" now surfaces the
+actual trust-related transcript passage and deck slides instead of the spurious music moment.
+
+## 2026-07-29 — Bug: confidence gate too strict for short/keyword queries
+
+Status: **complete**
+
+User asked "leadership" against a real, indexed PDF titled "Leadership Run Amok" and got an
+abstain, despite the document being genuinely about leadership. Diagnosed live: "leadership" scored
+`best_text=0.6715` against real matching content — below `TEXT_CONFIDENCE_THRESHOLD` (0.72). Rather
+than assume the number was just miscalibrated, ran this project's own
+`benchmark/calibrate_thresholds.py` inputs against the live index: two GIBBERISH negative-test
+queries ("asdkfj qwoeiru xzcvbn 12345 blorp", "zzxx flerm dorbat nnn 000 vvv qqq") scored 0.6967 and
+0.6837 on the SAME branch — higher than the real "leadership" query. No single
+`TEXT_CONFIDENCE_THRESHOLD` value can accept the real short query without also accepting nonsense —
+a known bge behavior on short/degenerate text, not a tunable number.
+
+Fix: a third, independent OR-pass signal alongside `best_visual`/`best_text` in
+`src/rag/search.py`. `_lexical_hit()` confirms a citation set when ALL of the query's significant
+words (stopword- and length-filtered) appear together, as real whole words, in a SINGLE candidate
+the dense branch already retrieved — bounded to already-retrieved candidates, not a corpus-wide
+keyword search. Threaded through `retrieve()` -> `gate_citations()` ->
+`answer_from_citations()`/`ask()`, plus `/ask_stream` and `/admin/debug/retrieve`
+(`src/api/search.py`); every existing caller that omits the new parameter defaults to `False` —
+identical behavior to before this fallback existed.
+
+**Caught a real bug in my own first version before shipping it.** An ANY-word-matches variant
+false-passed 3 of the 10 calibrated negative queries — "how does photosynthesis work in plants",
+"what's the weather like in Tokyo today", "how do I change a flat tire on my car" — each sharing
+exactly one common word ("work", "car", etc.) with something unrelated in this project's own
+eclectic corpus (AI/RAG papers, a leadership psychology article, engineering decks, video
+transcripts). Tightened to require ALL significant words together in the SAME candidate (a real
+lexical AND-match), then re-verified against the FULL calibration set: 10/10 negatives still
+correctly abstain, 14/14 positives still pass, and "leadership"/"leadership run" now both return
+grounded citations and a real synthesized answer live. Added `tests/test_lexical_gate.py` (17
+tests) covering `_significant_words`, `_lexical_hit` (including the ANY-vs-ALL regression case
+directly), and `gate_citations`'s three-way OR-pass.

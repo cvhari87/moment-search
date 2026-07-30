@@ -13,10 +13,25 @@ has no captions — the caller then just indexes it visually (never fatal).
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 from .. import config
 from .fetch import _yt_opts, scratch_dir
+
+# YouTube auto-captions emit non-speech event tags ("[Music]", "[Applause]",
+# "[Laughter]", ...) as literal cue text during dead air. Left in, these get
+# chunked and embedded exactly like real spoken content — and since they're
+# short, generic, degenerate text, bge embeds them into a moderately-similar
+# region of embedding space for almost ANY query (the same effect that made
+# gibberish negative-test queries score higher than genuine short positives —
+# see benchmark/calibrate_thresholds.py). Worse, a "[Music]" chunk sitting
+# near a frame in time gets cross-modal-boosted by _fuse() in src/rag/search.py
+# as if it genuinely confirmed that frame, even though it carries zero
+# semantic content — observed live: searching "trust" ranked a frame paired
+# with a nearby "[Music]" filler chunk ABOVE the one transcript passage that
+# actually says "trust takes years to build" (found in review).
+_NON_SPEECH_CUE_RE = re.compile(r"(?:\[[^\]]+\]\s*)+")
 
 
 def _sub_opts(video_id: str) -> dict:
@@ -42,7 +57,7 @@ def _parse_json3(path: Path) -> list[dict]:
         if not segs:
             continue
         text = "".join(s.get("utf8", "") for s in segs).strip()
-        if not text:
+        if not text or _NON_SPEECH_CUE_RE.fullmatch(text):
             continue
         t0 = ev.get("tStartMs", 0) / 1000.0
         dur = ev.get("dDurationMs", 0) / 1000.0

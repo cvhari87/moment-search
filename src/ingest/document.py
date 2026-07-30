@@ -4,8 +4,14 @@ stage-tasks, checkpointed from the start.
 pending -> parsing -> chunking -> embedding -> indexed | failed
 
 Stages:
-  1. parse   fetch the PDF into memory (size-capped, magic-byte-checked),
-             extract per-page text with real page numbers -> commit
+  1. parse   fetch the document into memory (size-capped, structurally
+             checked as PDF or PPTX — see sniff_document_kind). A .pptx is
+             converted to PDF server-side (headless LibreOffice, its own
+             checkpoint -> docs/{user}/{id}/{kind}/{_PARSE_VERSION}/
+             converted.pdf) BEFORE extraction, so a .pptx deck and a
+             hand-exported .pdf of the same deck converge to the identical
+             extraction code path. Then extract per-page text with real
+             page numbers -> commit
              docs/{user}/{id}/{kind}/{_PARSE_VERSION}/parsed.json
   2. chunk   page-aware chunking (never spans two pages — the page number
              IS the locator) -> commit
@@ -52,15 +58,20 @@ from ..config import (
     DECK_SLIDE_MIN_CHARS,
     DECK_SLIDE_RENDER_DPI,
     DOCUMENT_CHUNK_CHARS,
+    DOCUMENT_CONVERT_TIMEOUT_S,
     DOCUMENT_FETCH_ALLOWED_INTERNAL_HOSTS,
     DOCUMENT_FETCH_MAX_MB,
     DOCUMENT_MAX_CHUNKS,
+    DOCUMENT_MAX_CONVERTED_MB,
+    DOCUMENT_MAX_CONVERTED_PAGES,
     TEXT_EMBED_VERSION,
 )
 from ..rag import vector_store
 from ..rag.embeddings import embed_docs
+from .detect import PARSE_VERSION, converted_pdf_key as _converted_pdf_key, sniff_document_kind
 
 _MAX_BYTES = DOCUMENT_FETCH_MAX_MB * 1024 * 1024
+_MAX_CONVERTED_BYTES = DOCUMENT_MAX_CONVERTED_MB * 1024 * 1024
 
 
 class PermanentDocumentError(ValueError):
@@ -91,7 +102,10 @@ KIND_SPEC = {"paper": "page", "deck": "slide"}
 # before the caption branch existed would be treated as "already done" and
 # the new text-poor-slide captioning would simply never run for it, since
 # _load_checkpoint only regenerates on missing/corrupt/invalid, not stale.
-_PARSE_VERSION = "v2"
+# Defined in detect.py (not here) so src/rag/search.py can share the exact
+# same value without importing this module's prefect dependency — see
+# detect.py's own docstring.
+_PARSE_VERSION = PARSE_VERSION
 
 
 def _parsed_key(user_id: str, doc_id: str, kind: str) -> str:
@@ -183,6 +197,70 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
         self.sock = context.wrap_socket(sock, server_hostname=self.host)
 
 
+def _convert_pptx_to_pdf(data: bytes) -> bytes:
+    """Block M: shell out to headless LibreOffice (`soffice`) to convert a
+    .pptx deck to PDF bytes, so every downstream stage — page-aware
+    chunking, the slide locator, vision-captioning of text-poor slides,
+    checkpointing — reuses _parse_pdf completely unchanged; a .pptx deck and
+    a hand-exported .pdf of the same deck converge to the identical code
+    path one step earlier, not a second extraction implementation via
+    python-pptx.
+
+    `-env:UserInstallation` points LibreOffice at a fresh, per-call profile
+    directory instead of the default shared one: several flow-run
+    subprocesses can call this concurrently (WORKER_CONCURRENCY > 1), and
+    headless soffice instances sharing ONE profile directory take a lock on
+    it — a second concurrent invocation would fail with "invalid profile"
+    or hang waiting for the first to exit, not run in parallel."""
+    import pathlib
+    import subprocess
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = pathlib.Path(tmp)
+        src = tmp_path / "deck.pptx"
+        src.write_bytes(data)
+        profile_dir = tmp_path / "loprofile"
+        try:
+            subprocess.run(
+                ["soffice", "--headless", "--norestore",
+                 f"-env:UserInstallation=file://{profile_dir}",
+                 "--convert-to", "pdf", "--outdir", str(tmp_path), str(src)],
+                check=True, capture_output=True, timeout=DOCUMENT_CONVERT_TIMEOUT_S,
+            )
+        except subprocess.CalledProcessError as exc:
+            # Deterministic given the same bytes — same input, same
+            # LibreOffice, same outcome. Same reasoning _parse_pdf's own
+            # except-clause below uses for a corrupt PDF.
+            stderr = exc.stderr.decode(errors="replace")[:500] if exc.stderr else ""
+            raise PermanentDocumentError(
+                f"LibreOffice PPTX->PDF conversion failed: {stderr}") from exc
+        except subprocess.TimeoutExpired as exc:
+            raise PermanentDocumentError(
+                f"LibreOffice PPTX->PDF conversion exceeded "
+                f"{DOCUMENT_CONVERT_TIMEOUT_S}s") from exc
+        out = tmp_path / "deck.pdf"
+        if not out.exists():
+            raise PermanentDocumentError(
+                "LibreOffice reported success but produced no PDF output")
+        output_size = out.stat().st_size
+        if output_size > _MAX_CONVERTED_BYTES:
+            raise PermanentDocumentError(
+                f"converted PDF exceeds {DOCUMENT_MAX_CONVERTED_MB}MB limit "
+                f"({output_size} bytes)")
+        pdf = out.read_bytes()
+        # Validate what we're about to hand downstream AND checkpoint. This
+        # runs before t_parse commits converted.pdf, so a truncated or
+        # non-PDF output can never be cached as a "valid" checkpoint that
+        # every later retry then trusts and reuses (_load_checkpoint's
+        # revalidation covers the JSON artifacts, but converted.pdf is raw
+        # bytes read back with storage.get_bytes, not validated JSON).
+        if not pdf.startswith(b"%PDF"):
+            raise PermanentDocumentError(
+                "LibreOffice output is not a PDF (missing %PDF magic bytes)")
+        return pdf
+
+
 def _fetch_bytes(uri: str) -> bytes:
     """Size-capped, magic-byte-checked, SSRF-hardened fetch. Deliberately no
     auth/cookies/special-casing (unlike fetch.py's YouTube path) — every
@@ -224,8 +302,9 @@ def _fetch_bytes(uri: str) -> bytes:
 
     if len(data) > _MAX_BYTES:
         raise PermanentDocumentError(f"document exceeds {DOCUMENT_FETCH_MAX_MB}MB fetch limit")
-    if not data.startswith(b"%PDF"):
-        raise PermanentDocumentError("fetched content is not a PDF (missing %PDF magic bytes)")
+    if sniff_document_kind(data) is None:
+        raise PermanentDocumentError(
+            "fetched content is not a PDF or PPTX (structural check failed)")
     return data
 
 
@@ -239,6 +318,19 @@ def _resolve_caption_llm(user_id: str) -> llm.LLMConfig | None:
 
     cfg, _source = resolve_llm(user_id)
     return cfg
+
+
+def _pdf_page_count(data: bytes) -> int:
+    """Cheap: fitz.open just reads the PDF's page table, no per-page
+    decoding — safe to call before deciding whether _parse_pdf's real,
+    per-page (and possibly per-slide-caption) work is worth doing at all."""
+    import fitz  # pymupdf
+
+    doc = fitz.open(stream=data, filetype="pdf")
+    try:
+        return len(doc)
+    finally:
+        doc.close()
 
 
 def _parse_pdf(data: bytes, kind: str, user_id: str) -> list[dict]:
@@ -371,6 +463,23 @@ def _load_checkpoint(key: str, validate) -> list[dict] | None:
     return data
 
 
+def _converted_checkpoint_exists(key: str) -> bool:
+    """Check a raw converted-PDF checkpoint without downloading it.
+
+    This runs only in the ingestion/resume path. Citation rendering uses
+    the persisted manifest key and performs no object-storage probe."""
+    meta = storage.head(key)
+    if meta is None:
+        return False
+    checkpoint_size = int(meta.get("size", 0))
+    if checkpoint_size > _MAX_CONVERTED_BYTES:
+        raise PermanentDocumentError(
+            f"converted PDF checkpoint exceeds "
+            f"{DOCUMENT_MAX_CONVERTED_MB}MB limit "
+            f"({checkpoint_size} bytes)")
+    return True
+
+
 def _skip_retry_on_permanent_error(task, task_run, state) -> bool:
     """t_parse's retry_condition_fn: False (don't retry) when the task
     failed with a PermanentDocumentError — deterministic given the same
@@ -387,19 +496,97 @@ def _skip_retry_on_permanent_error(task, task_run, state) -> bool:
      retry_condition_fn=_skip_retry_on_permanent_error)
 def t_parse(doc_id: str, user_id: str, uri: str | None, kind: str, generation: int,
            storage_key: str | None = None) -> list[dict]:
-    """Get the raw PDF bytes one of two ways: `storage_key` (an upload
-    already sitting in OUR storage — read directly, no fetch, no expiry,
-    trusted the same way a checkpoint read is) takes priority over `uri`
-    (an external https:// document — SSRF-hardened HTTP fetch, since we
-    don't already have those bytes ourselves). Exactly one is set per row
+    """Get the raw document bytes (PDF or PPTX — see sniff_document_kind) one
+    of two ways: `storage_key` (an upload already sitting in OUR storage —
+    read directly, no fetch, no expiry, trusted the same way a checkpoint
+    read is) takes priority over `uri` (an external https:// document —
+    SSRF-hardened HTTP fetch, since we don't already have those bytes
+    ourselves). Exactly one is set per row
     (src/api/documents.py's _register)."""
     db.set_status(doc_id, "parsing", generation=generation)
     key = _parsed_key(user_id, doc_id, kind)
     cached = _load_checkpoint(key, _valid_parsed_pages)
     if cached is not None:
+        # Upgrade a PPTX checkpoint created before the manifest gained
+        # view_storage_key. Check the derivative here in the worker's resume
+        # path (not on every search citation); this also covers URI PPTX rows,
+        # which have no original storage_key or trustworthy filename.
+        conv_key = _converted_pdf_key(user_id, doc_id, kind)
+        if kind == "deck" and _converted_checkpoint_exists(conv_key):
+            db.set_status(
+                doc_id, "parsing", view_storage_key=conv_key,
+                generation=generation)
         print(f"[parse] {doc_id}: parsed.json already committed — resuming from checkpoint")
         return cached
     data = storage.get_bytes(storage_key) if storage_key else _fetch_bytes(uri)
+    doc_kind = sniff_document_kind(data)
+    if doc_kind is None:
+        raise PermanentDocumentError(
+            "document bytes are neither a PDF nor a PPTX (structural check failed)")
+    if doc_kind == "pptx" and kind != "deck":
+        # src/api/documents.py forces kind="deck" for a sniffed PPTX at
+        # upload time, but a URL registration can't sniff the bytes until
+        # THIS fetch — a paper-registered URI that turns out to serve a
+        # .pptx must not proceed under kind="paper" (wrong "page N" locators,
+        # and checkpoint keys below are namespaced by `kind` — see
+        # converted_pdf_key/_parsed_key — so continuing would write a
+        # converted.pdf/parsed.json under the wrong kind's path). Permanent:
+        # the same URI serves the same bytes on every retry (found in review).
+        raise PermanentDocumentError(
+            f"fetched document is a PPTX presentation but was registered as "
+            f"kind={kind!r} — re-register it with kind=\"deck\".")
+    if doc_kind == "pptx":
+        # Block M: convert BEFORE _parse_pdf, checkpointed separately from
+        # parsed.json — LibreOffice's headless conversion isn't instant for
+        # a large deck, so a worker killed after conversion but before
+        # parsed.json commits must not pay that cost again on retry.
+        conv_key = _converted_pdf_key(user_id, doc_id, kind)
+        cached_pdf = None
+        # HEAD first: get_bytes() buffers the whole object, so checking its
+        # length after download would not protect worker memory from an
+        # oversized/corrupt checkpoint.
+        if _converted_checkpoint_exists(conv_key):
+            candidate = storage.get_bytes(conv_key)
+            # Revalidate on READ, same principle as _load_checkpoint's shape
+            # check on the JSON artifacts: a stale, hand-edited, or foreign
+            # file at this key must fall back to "doesn't exist" (redo the
+            # stage) rather than wedge every future retry on bytes pymupdf
+            # will reject identically forever.
+            if candidate.startswith(b"%PDF"):
+                cached_pdf = candidate
+            else:
+                print(f"[checkpoint] {conv_key}: not a PDF — redoing conversion")
+        if cached_pdf is not None:
+            print(f"[parse] {doc_id}: converted.pdf already committed — "
+                  f"skipping LibreOffice conversion")
+            data = cached_pdf
+        else:
+            data = _convert_pptx_to_pdf(data)
+            db.check_generation(doc_id, generation)  # see the identical check below
+            storage.put_bytes(conv_key, data, "application/pdf")
+        # Checked BEFORE _parse_pdf, not after: a slide count this large is
+        # what DOCUMENT_MAX_CHUNKS is already meant to guard against, but
+        # that cap is only checked once every page has already been through
+        # (possibly vision-captioned by) _parse_pdf — a pathological deck's
+        # LLM-captioning cost would already be spent by the time it fires.
+        try:
+            page_count = _pdf_page_count(data)
+        except Exception as exc:
+            # Fixed converted bytes will fail page-table inspection the same
+            # way on every retry. Classify this consistently with the full
+            # _parse_pdf failure below so Prefect does not burn retry delays.
+            raise PermanentDocumentError(
+                f"failed to inspect converted PDF: "
+                f"{type(exc).__name__}: {exc}") from exc
+        if page_count > DOCUMENT_MAX_CONVERTED_PAGES:
+            raise PermanentDocumentError(
+                f"converted deck has {page_count} slides, exceeding the "
+                f"{DOCUMENT_MAX_CONVERTED_PAGES}-slide cap")
+        # The derivative is durable and structurally readable. Persist its
+        # exact key once so every citation can select it without probing
+        # object storage on the latency-sensitive query path.
+        db.set_status(doc_id, "parsing", view_storage_key=conv_key,
+                      generation=generation)
     try:
         pages = _parse_pdf(data, kind, user_id)
     except Exception as exc:

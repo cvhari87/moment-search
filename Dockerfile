@@ -7,10 +7,18 @@ FROM python:3.11-slim
 
 # ffmpeg = frame sampling. nodejs = the JavaScript runtime yt-dlp needs to
 # extract YouTube formats (without it, EVERY YouTube video fails with "This
-# video is not available"). Both matter only to the worker but cost little here.
+# video is not available"). libreoffice-impress = headless .pptx -> PDF
+# conversion (Block M's t_parse, via `soffice --headless --convert-to pdf`;
+# pulls in libreoffice-core as a dependency, which provides the soffice
+# binary itself — the Impress-only package avoids pulling in Writer/Calc/
+# Draw's own filters, real image-size savings for a feature only one input
+# path uses). All three matter only to the worker but cost little enough to
+# keep this one shared image simple (api/clip/seed carry the same layer,
+# unused).
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     nodejs \
+    libreoffice-impress \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

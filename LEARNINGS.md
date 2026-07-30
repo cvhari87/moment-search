@@ -1182,3 +1182,212 @@ question about workload separation, not model separation. Sub-batching was an at
 contention shorter; the actual fix was to make contention impossible. When a targeted fix doesn't
 move the number it was meant to move, the next move is to ask what's one level ABOVE the fix just
 made — not to conclude the metric is stuck and move on.
+
+## Local source code, the Docker image, and the browser are three different versions of the application
+
+Editing a file in the repository does not automatically change the application already running at
+`localhost:8100`. Docker Compose builds a snapshot of the repository into an image and starts a
+container from that snapshot. This project's Compose file mounts `./data` into the containers, but
+does **not** mount `./src` or `./ui`. That is intentional: the containers behave more like the
+eventual deployment, but it also means a source edit remains invisible until the affected services
+are rebuilt and recreated.
+
+In plain English, imagine editing the recipe after a cake has already been baked. The recipe on the
+counter is newer, but the cake still reflects the old recipe. Refreshing the browser only asks for
+another slice of the existing cake; it does not rebake it. A hard refresh therefore cannot load a
+Python or HTML change that never entered the running Docker image. After an implementation change,
+rebuild the stack (while preserving the required two-worker shape) with:
+
+```bash
+docker compose up -d --build --scale worker=2
+```
+
+When the UI appears stale, compare the running container with the checkout instead of assuming a
+browser-cache problem. Useful evidence includes the container creation/image time, whether a newly
+added file exists under `/app`, and checksums or identifying strings from the host and container
+copies. In the Block M check, the running API still contained the old “Only PDF uploads are
+accepted” branch and did not contain the new `src/ingest/detect.py`, proving that the container was
+stale rather than the browser.
+
+There is a second, independent UI distinction. `/` is the curated, read-only sample experience. It
+deliberately hides the upload controls and the entire documents panel. `/get-started` switches the
+same HTML page into full mode and reveals those controls. Being on the sample route can therefore
+look like a missing feature even when the feature is already present in the running image.
+
+Finally, backend capability and visible UI support are separate deliverables. Teaching the API and
+worker to validate, store, convert, and ingest a PPTX does not change an HTML file picker that still
+accepts only `application/pdf,.pdf`, nor does it change client-side wording such as “Choose a PDF
+first.” A complete vertical feature must be checked through every layer:
+
+1. The browser lets the user select the new file type and describes it accurately.
+2. The API validates and registers the upload.
+3. The queue admits it and a worker processes it.
+4. Durable checkpoints prevent repeated work after a restart.
+5. Search returns the result with the correct page or slide citation.
+
+Rebuilding solves “new code is not running.” Updating and testing every layer solves “the new
+capability is not exposed end to end.” They are different problems and should be verified
+separately.
+
+## The right storage key for re-processing isn't automatically the right key for viewing
+
+Block M's `t_parse` deliberately leaves an uploaded `.pptx`'s `storage_key` pointing at the
+ORIGINAL bytes — converting to PDF at parse time rather than upload time means the upload path
+stays a dumb, fast, unopinionated byte store, and a re-parse (say, after `_PARSE_VERSION` bumps)
+always has the true source material to work from, not a lossy derivative. That's the right call for
+INGESTION. It's the wrong call for VIEWING: `src/rag/search.py`'s `_doc_url` and
+`src/api/search.py`'s `/api/document/{id}` both serve citations straight from `storage_key`, so a
+PPTX-sourced deck's citation would hand the browser raw `.pptx` bytes — mislabeled
+`application/pdf` in the local-dev route, unlabeled in the presigned-URL route — either way, not
+something an `<iframe>` can render. Nothing in that code path was WRONG for a PDF-sourced document;
+it simply predated a second document kind whose "the thing we store" and "the thing a citation
+should open" are no longer the same file.
+
+This wasn't caught by the unit tests (they mocked storage and never asked "what does a browser
+actually receive"), and it wasn't something the plan's own exit criteria ("slide-numbered citations
+indistinguishable from a hand-exported PDF") would fail on paper — search and indexing worked
+perfectly; only clicking through to VIEW a PPTX-sourced citation would have been broken. It surfaced
+because live end-to-end verification included actually fetching `/api/document/{id}` and checking
+what `file` reported the bytes were, not just checking that `/api/ask` returned the right slide
+number. The general shape: whenever a feature introduces a new "the stored artifact and the
+served/rendered artifact can differ" case, grep for every OTHER reader of that same stored key, not
+just the one reader the feature's own code path touches — a field named `storage_key` looks like a
+single, uniform contract until one caller needs the original and another needs a derivative of it.
+
+The fix (`src/ingest/detect.py`'s `viewer_storage_key`) needed to be reachable from BOTH viewing
+routes without importing `src/ingest/document.py` — which imports `prefect` at module scope, a
+dependency this codebase deliberately keeps out of the API process (see the CLIP-service work:
+"processes in remote mode never drag in torch," same principle). That's why the checkpoint-key
+naming (`PARSE_VERSION`, `converted_pdf_key`) lives in the same tiny, dependency-light module as the
+magic-byte sniffing, rather than back in `document.py` where the writer of that checkpoint lives —
+the reader and the writer need to agree on the key FORMAT without the reader inheriting the writer's
+entire (heavy) module.
+
+### Do expensive existence checks when producing an artifact, not every time it is viewed
+
+The first citation fix asked object storage, “does the converted PDF exist?” each time a PPTX
+citation was rendered. In local development that is a cheap disk check. In production it is a
+network `HEAD` request to S3/GCS, repeated for every cited document in every answer. The worker
+already knows the exact moment the conversion has succeeded, so the better design is to record the
+converted PDF's key in the Postgres manifest (`view_storage_key`) once. Search then makes a simple
+choice from data it already fetched: use the browser-friendly derivative when present, otherwise
+use the original. In lay terms: write “the viewable copy is in this drawer” on the catalogue card
+when filing it, instead of walking to the storeroom to check the drawer whenever someone searches.
+
+### An input-size limit does not automatically limit generated output
+
+A PPTX under the 50 MB upload cap can expand into a much larger PDF during LibreOffice conversion.
+Checking `len(pdf)` after `read_bytes()` is too late: the worker has already allocated memory for
+the entire file. The safe boundary is metadata first—filesystem `stat()` for fresh output and
+object-storage `HEAD` for a cached derivative—then read only if it is within
+`DOCUMENT_MAX_CONVERTED_MB`. Slide count is a separate dimension, so
+`DOCUMENT_MAX_CONVERTED_PAGES` remains necessary even with the byte cap.
+
+Malformed converted PDFs are also permanent for a fixed input and converter version. Page-count
+inspection now translates parser errors into `PermanentDocumentError`, avoiding retries that wait
+30 and 120 seconds only to inspect the same corrupt bytes again.
+
+## A second review round on the same feature found four MORE real issues — not noise, a different depth of scrutiny
+
+The first guardrail review on Block M passed cleanly. A second round, asked to look harder, found:
+a security-relevant validation check that was a substring search dressed up as structural
+validation (and a zip-bomb vector in the same function); a helper whose early-return guard silently
+assumed the ONE caller it was written for was the ONLY caller, breaking a second real code path
+(URL-registered PPTX) it hadn't been tested against; a UI default that would silently produce the
+wrong citation semantics for the common case (no kind selected) unless the server independently
+enforced the invariant; and a piece of THIS SESSION'S OWN documentation overclaiming what a test
+had actually proven (a "mid-conversion crash" test that had only exercised "crash after conversion
+completes").
+
+None of these were found by re-running the existing test suite — it still passed, because the
+tests exercised what the code was WRITTEN to do, not what a determined adversary or an unconsidered
+second caller could do to it. Two generalizable patterns:
+
+1. **A structural check needs to validate structure, not the presence of a recognizable string.**
+   `b"presentationml.presentation" in content_types` LOOKS like it's checking the same thing real
+   XML parsing would — and passes every legitimate file — but a substring search can be satisfied by
+   bytes that were never meant to assert what the check is trusting them to assert. The tell was in
+   the code itself: an `in` check over raw bytes is always weaker than parsing the format and
+   checking a specific field, and the gap between them is exactly where a crafted, malicious input
+   lives. If a check is verifying trust (an upload could be malicious), prefer "parse it and check
+   the specific thing" over "does this byte sequence appear somewhere."
+2. **A helper's early-return guard encodes an assumption about ITS CALLER, not about the world** —
+   `if storage_key is None: return None` was correct for the ONE call site that existed when it was
+   written (uploads), and silently wrong the moment a second call site (URL registration) had a
+   legitimately different reason for `storage_key` to be `None`. The function's docstring even said
+   "shared by search.py's presigned path and api/search.py's local-dev fallback" — plural callers,
+   stated explicitly — but the guard itself was written for the single case that had actually been
+   tested. When a helper is DESIGNED to be shared, an early return that special-cases "the input
+   looks like case A" needs to be checked against every OTHER case the function claims to support,
+   not just the one that motivated writing it.
+
+On the documentation-overclaim specifically: writing "verified live, not just asserted" and then
+describing a test that verifies a WEAKER claim than the one being made is a failure mode worth
+naming on its own — it reads as more rigorous than it was, to a future reader (including a future
+instance of me) who trusts the "verified live" framing without re-deriving what was actually run.
+The fix wasn't just correcting the sentence; it was going back and running the STRONGER test (an
+actual `SIGKILL` of the `soffice` process mid-conversion) to find out what the real guarantee is,
+which turned out to be narrower and differently-shaped than either the plan's original wording or
+this document's first draft claimed — fail-safe and idempotent-on-retry, not resume-mid-conversion.
+That distinction only surfaces if you're willing to test the claim as literally stated, not the
+adjacent, easier-to-test claim that resembles it.
+
+## Closing a substring-search hole doesn't close every hole in the same family — check for the equality check being weakened, too
+
+The second review round (above) fixed `sniff_document_kind`'s PPTX check from a byte-substring
+search to real XML parsing against `_PRESENTATION_CONTENT_TYPE`. A THIRD, independent review found
+the replacement still wasn't exact: the comparison stripped `.main+xml` off the constant and used
+`startswith()` against what remained, so a crafted `[Content_Types].xml` declaring
+`...presentationml.presentation.evil` still passed — a different, narrower substring-style hole
+inside what looked like the fully-fixed version. Same underlying flaw, one layer down: "the value
+starts with what I expect" is still weaker than "the value IS what I expect," the same gap between
+"the string appears somewhere" and "the field maps correctly" that the SECOND round's fix was
+written to close. The generalizable check: after fixing a validation function from loose-match to
+structural parsing, re-read the comparison operator itself — `startswith`/`in`/`re.match` (unanchored)
+are all still weaker than `==`/`fullmatch`, and a fix that upgrades WHAT gets compared without also
+upgrading HOW it's compared can leave the same class of bug one level deeper, invisible to a test
+suite that only re-runs the cases the previous round already found.
+
+## A confidence threshold calibrated on questions doesn't automatically cover keywords
+
+A user's single-word query ("leadership") against a genuinely on-topic, correctly-indexed PDF was
+gated to an abstain — `TEXT_CONFIDENCE_THRESHOLD` (0.72) is a real, working number, calibrated by
+`benchmark/calibrate_thresholds.py` against this project's own labeled positive/negative query set.
+But every labeled positive in that set is a full natural-language question ("what does the survey
+say about hybrid retrieval"); nothing in the calibration set exercises a bare keyword. Checked live
+rather than just lowering the number: two GIBBERISH negative queries scored HIGHER on bge cosine
+similarity than the real "leadership" query — short, low-information text (real or nonsense) scores
+in an overlapping range on dense embeddings, so no single threshold value can separate a genuine
+short query from noise on that signal alone. The number wasn't wrong; the SIGNAL was insufficient
+for a query shape the calibration set never covered. The fix that actually generalizes needs a
+second, independent signal for the case dense similarity structurally can't resolve (here, an exact
+lexical AND-match against already-retrieved candidates) — not a lower number, which just moves
+which false positives get through instead of removing them. Lesson: a confidence gate's calibration
+is only as good as the query SHAPES in its labeled set, not just their topics — a calibration set
+built entirely from one query style (full questions) tells you nothing about how the same threshold
+behaves on a structurally different style (keywords) until you actually test that shape.
+
+Building the fix surfaced a second version of the same discipline: an ANY-word-matches first draft
+of the lexical fallback fixed the reported case but silently RE-broke 3 of the 10 already-calibrated
+negative queries (coincidental single-word overlaps with unrelated corpus content) — caught only
+because the fix was re-verified against the SAME full calibration set the original threshold was
+checked against, not just the one query it was built to fix. A gate-loosening fix is exactly as
+capable of reintroducing false positives as a gate-tightening fix is of reintroducing false
+negatives — both need the full before/after comparison, not a spot-check of the motivating case.
+
+## A fusion boost that rewards two signals "agreeing" needs both signals to be independently trustworthy, not just present
+
+Cross-modal fusion (`_fuse()`'s `CROSS_MODAL_BOOST`) ranks a video moment higher when a frame hit
+and a transcript hit land within the same time window — two independent signals pointing at the
+same instant being stronger evidence than either alone. That reasoning only holds if both hits are
+actually independent EVIDENCE, not just independently PRESENT. YouTube's auto-captions emit literal
+`[Music]`/`[Applause]` tags during non-speech stretches; nothing filtered those before they were
+chunked and embedded, so a near-meaningless filler chunk could land in the same time window as an
+unrelated frame purely by coincidence, and the boost treated their coincidental proximity as if it
+were corroboration. The bug wasn't in the fusion math — rewarding cross-modal agreement is the
+right idea — it was upstream, in what was allowed to count as a "signal" in the first place. The
+generalizable point: a fusion/ensemble step that combines multiple weak signals into a stronger one
+is only as sound as its weakest input's SEMANTIC validity, not just its presence in the candidate
+list — filtering degenerate/non-content inputs at the SOURCE (here, transcript ingestion) is a more
+robust fix than trying to make the combination logic defensive against every way an individual
+input could be meaningless.

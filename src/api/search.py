@@ -16,6 +16,7 @@ from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 
 from .. import config, db, llm, storage
+from ..ingest import detect
 from ..rag import search as rag_search
 from .videos import require_auth, user_id as user_id_dep
 
@@ -167,7 +168,7 @@ def debug_retrieve(q: str, x_user_id: str | None = Header(default=None)):
     uid = _uid(x_user_id)
     r = rag_search.retrieve(q.strip(), uid)
     return {"best_visual": r["best_visual"], "best_text": r["best_text"],
-            "n_citations": len(r["citations"])}
+            "lexical_hit": r["lexical_hit"], "n_citations": len(r["citations"])}
 
 
 def _sse(data: dict) -> str:
@@ -205,7 +206,8 @@ def ask_stream(q: str, top_k: int | None = None, x_user_id: str | None = Header(
         # answer that's about to follow. Same gate answer_from_citations
         # applies below, so the citations event and the eventual answer can
         # never disagree about whether anything was actually found.
-        gated = rag_search.gate_citations(r["citations"], r["best_visual"], r["best_text"])
+        gated = rag_search.gate_citations(r["citations"], r["best_visual"], r["best_text"],
+                                          r["lexical_hit"])
         # Citations with no retrieved text (e.g. a frame-only visual match)
         # would zero the assignment's all-or-nothing "grounded" check for
         # every OTHER citation in the same answer — drop them here. POST
@@ -226,7 +228,8 @@ def ask_stream(q: str, top_k: int | None = None, x_user_id: str | None = Header(
             c["n"] = i
         yield _sse({"citations": grounded_citations})
         result = rag_search.answer_from_citations(
-            question, uid, grounded_citations, r["best_visual"], r["best_text"])
+            question, uid, grounded_citations, r["best_visual"], r["best_text"],
+            r["lexical_hit"])
         yield _sse({k: v for k, v in result.items() if k != "citations"})
 
     return StreamingResponse(events(), media_type="text/event-stream",
@@ -302,15 +305,30 @@ def document(doc_id: str, u: str | None = None):
     """Local-dev PDF serving for uploaded papers/decks — the storage_key
     counterpart to /api/video for documents (a real bucket serves these via
     presigned URLs instead, from src.rag.search._doc_url, and never reaches
-    this route). Kind-checked so a video id can't be requested here either."""
+    this route). Kind-checked so a video id can't be requested here either.
+
+    A PPTX-sourced deck's storage_key is the ORIGINAL .pptx bytes (Block M
+    converts at parse time, not upload time) — viewer_storage_key swaps in
+    the converted PDF checkpoint when one exists, the same substitution
+    _doc_url makes for the presigned-URL path, so this route never serves
+    raw .pptx bytes labeled application/pdf.
+
+    Only requires storage_key OR a converted-PDF checkpoint, not
+    storage_key alone: a URL-registered PPTX (uri, no storage_key) still
+    gets converted at parse time and the result lands in OUR OWN storage
+    the same way an uploaded one's does — requiring storage_key here would
+    404 that checkpoint even though it exists (found in review)."""
     if storage.presign_capable():
         raise HTTPException(404, "Document viewing streams from object storage.")
     uid = _uid(u)
     row = db.get_video(doc_id)
-    if (row is None or row["user_id"] != uid or not row.get("storage_key")
-            or row.get("kind") not in ("paper", "deck")):
+    if row is None or row["user_id"] != uid or row.get("kind") not in ("paper", "deck"):
         raise HTTPException(404, "Document not found.")
-    path = storage.local_path(row["storage_key"])
+    key = detect.viewer_storage_key(
+        row.get("storage_key"), row.get("view_storage_key"))
+    if not key:
+        raise HTTPException(404, "Document not found.")
+    path = storage.local_path(key)
     if not path.exists():
         raise HTTPException(404, "Document file not found.")
     return FileResponse(path, media_type="application/pdf",

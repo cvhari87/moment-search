@@ -277,6 +277,25 @@ DOCUMENT_FETCH_ALLOWED_INTERNAL_HOSTS = [
     h.strip().lower() for h in os.getenv("DOCUMENT_FETCH_ALLOWED_INTERNAL_HOSTS", "api:8000").split(",")
     if h.strip()
 ]
+# Block M: a native .pptx upload/URI is converted to PDF server-side (headless
+# LibreOffice) as the first step of t_parse, before the existing pymupdf
+# extraction runs unchanged — see src/ingest/document.py's
+# _convert_pptx_to_pdf. Generous but bounded: a large deck's conversion is
+# genuinely slow (not instant, per Block M's own exit criteria), and a
+# hung/crashed soffice process must not hold a worker slot indefinitely.
+DOCUMENT_CONVERT_TIMEOUT_S = _float("DOCUMENT_CONVERT_TIMEOUT_S", 300.0)
+# LibreOffice can expand a compact PPTX into a much larger PDF. Bound the
+# derivative independently of the source fetch/upload cap so conversion can
+# never allocate or checkpoint an arbitrarily large output.
+DOCUMENT_MAX_CONVERTED_MB = _int("DOCUMENT_MAX_CONVERTED_MB", 100)
+# A small, well-under-the-byte-cap .pptx can still have a huge SLIDE count
+# (thousands of near-empty slides) — DOCUMENT_MAX_CHUNKS only catches that
+# AFTER _parse_pdf has already run vision-captioning (a real LLM call) on
+# every text-poor slide, so a pathological deck's cost is paid before the
+# existing cap ever fires. Checked right after conversion, before parsing —
+# a deck this large isn't a realistic ceiling to hit, it's an abuse/cost
+# guard (found in review).
+DOCUMENT_MAX_CONVERTED_PAGES = _int("DOCUMENT_MAX_CONVERTED_PAGES", 500)
 # Deck-only: a slide whose extracted text is shorter than this is treated as
 # text-poor (title slide, diagram, photo) and rendered + captioned by the
 # vision LLM instead of embedding near-nothing. Papers never take this

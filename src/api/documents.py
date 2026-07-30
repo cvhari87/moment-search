@@ -10,16 +10,18 @@ Both source kinds land in the SAME `ms_videos` table (see src/db.py) — a
 need no rewrite to fairly admit documents alongside videos.
 
 The upload path does NOT give ingestion a second, different fetch
-mechanism to trust — an uploaded PDF is written straight to this app's own
-object storage under a private, content-addressed key (documents/{user}/
-{sha256}.pdf, never under the public corpus/ prefix that /corpus/{name}
-serves unauthenticated) and the manifest row's `storage_key` points at it.
-src/ingest/document.py reads it back with storage.get_bytes() — no HTTP
-hop, no SSRF surface, no presigned URL that could expire before a worker
-gets to it or a later retry runs. The SSRF-hardened HTTP fetch
-(_fetch_bytes) is reserved for the OTHER registration path — a real
-external https:// paper/deck URL, which is the one case where we don't
-already have the bytes ourselves.
+mechanism to trust — an uploaded PDF or PPTX is written straight to this
+app's own object storage under a private, content-addressed key
+(documents/{user}/{sha256}.pdf or .pptx, never under the public corpus/
+prefix that /corpus/{name} serves unauthenticated) and the manifest row's
+`storage_key` points at it. src/ingest/document.py reads it back with
+storage.get_bytes() — no HTTP hop, no SSRF surface, no presigned URL that
+could expire before a worker gets to it or a later retry runs. The
+SSRF-hardened HTTP fetch (_fetch_bytes) is reserved for the OTHER
+registration path — a real external https:// paper/deck URL, which is the
+one case where we don't already have the bytes ourselves. A .pptx is
+stored as-is here too (see Block M) — conversion to PDF happens
+server-side inside t_parse, not at upload time.
 """
 from __future__ import annotations
 
@@ -33,6 +35,7 @@ from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
 
 from .. import config, db, storage
+from ..ingest.detect import sniff_document_kind
 from .videos import _PUBLIC_FIELDS, require_auth, user_id
 
 router = APIRouter(prefix="/admin", tags=["documents"])
@@ -41,6 +44,19 @@ _URI_RE = re.compile(r"^https?://\S+$")
 _KINDS = ("paper", "deck")
 _UPLOAD_MAX_BYTES = config.DOCUMENT_FETCH_MAX_MB * 1024 * 1024
 _UPLOAD_KEY_PREFIX = "documents/"  # private — distinct from the public corpus/ prefix
+
+
+def _enforce_kind_for_sniffed_type(doc_kind: str, requested_kind: str) -> str:
+    """A .pptx is unambiguously a presentation — force kind="deck"
+    server-side regardless of what the client's dropdown (or a caller
+    bypassing the UI entirely) requested, rather than trusting it. The
+    client defaulting to "Paper" would otherwise silently produce "page N"
+    locators for a slide deck instead of "slide N" (found in review — this
+    is what KIND_SPEC's page/slide split is FOR; a pptx choosing the wrong
+    one isn't a cosmetic label mismatch, it's the wrong semantic locator).
+    A sniffed 'pdf' never overrides — the user's choice of paper vs. deck
+    for an actual PDF is a real, legitimate distinction this can't infer."""
+    return "deck" if doc_kind == "pptx" else requested_kind
 
 
 def _obviously_unsafe_host(uri: str) -> bool:
@@ -126,11 +142,11 @@ def register_document(req: RegisterDocument, uid: str = Depends(user_id)):
 @router.post("/documents/upload", status_code=202, dependencies=[Depends(require_auth)])
 async def upload_document(file: UploadFile = File(...), kind: str = Form(...),
                           title: str | None = Form(None), uid: str = Depends(user_id)):
-    """Direct file upload — no presign step, unlike videos. A PDF (capped at
-    DOCUMENT_FETCH_MAX_MB) is cheap enough to pass through the API process
-    itself; presigning exists for videos because those are large enough
-    that routing gigabytes through this process would be wasteful, not
-    because a bypass is required in principle.
+    """Direct file upload — no presign step, unlike videos. A PDF or PPTX
+    (capped at DOCUMENT_FETCH_MAX_MB) is cheap enough to pass through the
+    API process itself; presigning exists for videos because those are
+    large enough that routing gigabytes through this process would be
+    wasteful, not because a bypass is required in principle.
 
     This is a deliberate, narrow exception to "ingestion never does
     synchronous work in the request path" (ASSIGNMENT_AGENTS.md non-
@@ -142,7 +158,7 @@ async def upload_document(file: UploadFile = File(...), kind: str = Form(...),
     uri-registration path above) does no I/O at all before returning.
 
     The bytes land under a PRIVATE, content-addressed key
-    (documents/{user}/{sha256}.pdf) — never the public corpus/ prefix, which
+    (documents/{user}/{sha256}.pdf or .pptx) — never the public corpus/ prefix, which
     /corpus/{name} serves to anyone with no auth (that route exists only for
     this app's own self-hosted deck, a deliberately public fixture). Ingestion
     reads the key straight from storage (storage_key on the row), so there is
@@ -154,15 +170,25 @@ async def upload_document(file: UploadFile = File(...), kind: str = Form(...),
     data = await file.read(_UPLOAD_MAX_BYTES + 1)
     if len(data) > _UPLOAD_MAX_BYTES:
         raise HTTPException(413, f"File exceeds the {config.DOCUMENT_FETCH_MAX_MB}MB limit.")
-    if not data.startswith(b"%PDF"):
-        raise HTTPException(415, "Only PDF uploads are accepted.")
+    # Structural check (magic bytes + real zip/XML structure for a .pptx),
+    # not the filename or the browser-supplied content-type — both are
+    # trivially spoofable the same way a renamed .txt could once claim
+    # `%PDF`. Block M: a .pptx is converted to PDF server-side, as the first
+    # step of t_parse (src/ingest/document.py) — the ORIGINAL .pptx bytes
+    # are what's stored and checkpointed here, not a pre-converted PDF.
+    doc_kind = sniff_document_kind(data)
+    if doc_kind is None:
+        raise HTTPException(415, "Only PDF or PPTX uploads are accepted.")
+    kind = _enforce_kind_for_sniffed_type(doc_kind, kind)
 
     digest = hashlib.sha256(data).hexdigest()[:16]
-    key = f"{_UPLOAD_KEY_PREFIX}{uid}/{digest}.pdf"
+    key = f"{_UPLOAD_KEY_PREFIX}{uid}/{digest}.{doc_kind}"
+    content_type = ("application/pdf" if doc_kind == "pdf" else
+                    "application/vnd.openxmlformats-officedocument.presentationml.presentation")
     # Off the event loop: boto3/GCS calls are blocking, and a 50MB body
     # sitting in this coroutine would otherwise stall every other request
     # this API process is handling concurrently.
-    await run_in_threadpool(storage.put_bytes, key, data, "application/pdf")
+    await run_in_threadpool(storage.put_bytes, key, data, content_type)
 
     return _register(uid, kind, title or file.filename,
                      storage_key=key, source_hash=f"upload:{digest}")

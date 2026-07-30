@@ -15,6 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from .. import config, db, llm, storage
+from ..ingest import detect
 from ..config import (BRANCH_TOP_K, CONFIDENCE_THRESHOLD, CROSS_MODAL_BOOST,
                       DOCUMENT_FETCH_ALLOWED_INTERNAL_HOSTS, FUSION_WINDOW_S,
                       RRF_K, TEXT_CONFIDENCE_THRESHOLD, TOP_K)
@@ -28,6 +29,62 @@ ABSTAIN = ("I couldn't find that in your videos — nothing indexed looks "
 def _seconds(ms: int) -> str:
     s = ms // 1000
     return f"{s // 60:02d}:{s % 60:02d}"
+
+
+_STOPWORDS = frozenset("""
+the a an and or but if then than so is are was were be been being this
+that these those there here it its what which who whom whose when where
+why how do does did doing have has had having will would shall should
+can could may might must not no nor of in on at to from for with about
+into through during before after above below between out over under
+again further once you your yours i me my we our us they them their
+he she his her him
+""".split())
+_WORD_RE = re.compile(r"[a-zA-Z]{3,}")
+
+
+def _significant_words(text: str) -> set[str]:
+    """Lowercased words worth treating as a real keyword signal — drops
+    common function/question words (which would match almost any chunk) and
+    anything under 3 letters. Feeds _lexical_hit's confirmation check."""
+    return {w for w in _WORD_RE.findall(text.lower()) if w not in _STOPWORDS}
+
+
+def _lexical_hit(question_words: set[str], candidates: list[dict]) -> bool:
+    """True if ALL of the query's significant words appear as real, whole
+    words (not substrings inside longer words — both sides are tokenized
+    the same way) together in the SAME already-retrieved text-branch
+    candidate.
+
+    A confirmation signal independent of raw cosine similarity: dense (bge)
+    embeddings score short/keyword queries measurably lower than full
+    natural-language questions, even against genuinely relevant prose —
+    confirmed live against this project's own calibration set
+    (benchmark/calibrate_thresholds.py): a literal "leadership" query
+    scored BELOW two gibberish negative-test queries on cosine similarity
+    alone, meaning no TEXT_CONFIDENCE_THRESHOLD value can both accept it and
+    reject nonsense.
+
+    Requiring EVERY significant word (not just one) in a single candidate is
+    deliberate, not the obvious first cut: an earlier ANY-word version
+    false-passed 3 of 10 calibrated negatives — "how does photosynthesis
+    work in plants", "what's the weather like in Tokyo today", "how do I
+    change a flat tire on my car" — each sharing exactly one common word
+    ("work", "weather"-adjacent terms, "car") with SOMETHING in this
+    project's own eclectic corpus (AI/RAG papers, a leadership psychology
+    article, engineering decks, video transcripts), verified live against
+    benchmark/negative_queries.jsonl (found in review). ALL-words-together
+    is a real, bounded lexical AND-match — the query's actual content has
+    to genuinely be in the candidate, not just one coincidental word."""
+    if not question_words:
+        return False
+    for h in candidates:
+        text = (h.get("text") or "").lower()
+        if not text:
+            continue
+        if question_words <= set(_WORD_RE.findall(text)):
+            return True
+    return False
 
 
 def _locator(h: dict) -> tuple[str, float | int]:
@@ -141,12 +198,20 @@ def _doc_url(video: dict | None, user_id: str, doc_id: str) -> str | None:
     (storage_key — private, content-addressed, never expires) over `uri`;
     falls back to `uri` only for URL-registered documents, which never get a
     storage_key (src/ingest/document.py reads those straight off the source
-    URL instead of a local copy — see docstring there)."""
+    URL instead of a local copy — see docstring there).
+
+    A PPTX-sourced deck's storage_key points at the ORIGINAL .pptx bytes —
+    Block M converts to PDF at parse time, not at upload time, so the
+    upload itself is untouched. viewer_storage_key swaps in the converted
+    PDF checkpoint for VIEWING when one exists, since a browser can't
+    render raw .pptx bytes inline the way it can a PDF."""
     if not video:
         return None
-    if video.get("storage_key"):
+    effective_key = detect.viewer_storage_key(
+        video.get("storage_key"), video.get("view_storage_key"))
+    if effective_key:
         if storage.presign_capable():
-            return storage.presign_get(video["storage_key"])
+            return storage.presign_get(effective_key)
         return f"/api/document/{doc_id}?u={user_id}"
     uri = video.get("uri")
     if uri:
@@ -188,9 +253,11 @@ def retrieve(question: str, user_id: str, *, top_k: int | None = None,
     """Multimodal retrieve: query BOTH branches (CLIP frames + transcript text),
     fuse by RRF into time windows, and return numbered moment-citations.
 
-    Returns {citations, best_visual, best_text} — the two raw bests feed the
-    confidence gate (RRF scores are too small to threshold on). video_ids scopes
-    the search to chosen videos (UI select/unselect)."""
+    Returns {citations, best_visual, best_text, lexical_hit} — best_visual/
+    best_text feed the confidence gate (RRF scores are too small to
+    threshold on); lexical_hit is a third, independent OR-pass signal for
+    that same gate (see _lexical_hit). video_ids scopes the search to
+    chosen videos (UI select/unselect)."""
     k = top_k or TOP_K
 
     # Visual branch — CLIP text→image.
@@ -201,11 +268,13 @@ def retrieve(question: str, user_id: str, *, top_k: int | None = None,
     # Text branch — bge query→transcript-chunk (only if transcript is enabled).
     thits: list[dict] = []
     best_text = 0.0
+    lexical_hit = False
     if config.ENABLE_TRANSCRIPT:
         thits = vector_store.search_text(embed_query(question), user_id,
                                          top_k=BRANCH_TOP_K, video_id=video_id,
                                          video_ids=video_ids)
         best_text = thits[0]["score"] if thits else 0.0
+        lexical_hit = _lexical_hit(_significant_words(question), thits)
 
     windows = _fuse(vhits, thits)[:k]
     videos = db.videos_by_ids(sorted({w["video_id"] for w in windows}))
@@ -265,7 +334,8 @@ def retrieve(question: str, user_id: str, *, top_k: int | None = None,
             "transcript": (tx or {}).get("text"),
             "modalities": sorted(w["modalities"]),
         })
-    return {"citations": citations, "best_visual": best_visual, "best_text": best_text}
+    return {"citations": citations, "best_visual": best_visual, "best_text": best_text,
+            "lexical_hit": lexical_hit}
 
 
 def _fallback_answer(citations: list[dict[str, Any]]) -> str:
@@ -322,32 +392,45 @@ def resolve_llm(user_id: str) -> tuple[llm.LLMConfig | None, str]:
 
 
 def gate_citations(citations: list[dict[str, Any]], best_visual: float,
-                   best_text: float) -> list[dict[str, Any]]:
+                   best_text: float, lexical_hit: bool = False) -> list[dict[str, Any]]:
     """Confidence Gate 1, applied to the CITATIONS themselves, not just
     whether to bother calling the LLM. A query with nothing relevant indexed
-    (raw per-branch bests both below threshold) must not surface citations
-    at all — "I couldn't find that" next to five confident-looking source
-    cards is a worse contract violation than an honest empty result, both to
-    a person reading the UI and to the evaluator's "empty retrieval -> empty
-    citations" requirement. The single source of truth for this decision:
-    answer_from_citations and /ask_stream (src/api/search.py) both call this
-    instead of each re-deriving the same threshold check."""
+    (raw per-branch bests both below threshold, AND no literal keyword
+    confirmation) must not surface citations at all — "I couldn't find that"
+    next to five confident-looking source cards is a worse contract
+    violation than an honest empty result, both to a person reading the UI
+    and to the evaluator's "empty retrieval -> empty citations" requirement.
+    The single source of truth for this decision: answer_from_citations and
+    /ask_stream (src/api/search.py) both call this instead of each
+    re-deriving the same threshold check.
+
+    `lexical_hit` (see retrieve()/_lexical_hit) is a third OR-pass alongside
+    best_visual/best_text — a short, keyword-style query ("leadership")
+    that clears neither cosine threshold can still pass here if the query's
+    own words genuinely appear in an already-retrieved candidate, rather
+    than abstaining just because dense embeddings underscore short queries
+    (found in review, confirmed against benchmark/calibrate_thresholds.py's
+    own negative set: a real "leadership" query scored BELOW two gibberish
+    negatives on cosine similarity alone, so no threshold value could have
+    fixed this)."""
     if not citations:
         return []
-    if CONFIDENCE_THRESHOLD and best_visual < CONFIDENCE_THRESHOLD and best_text < TEXT_CONFIDENCE_THRESHOLD:
+    if (CONFIDENCE_THRESHOLD and best_visual < CONFIDENCE_THRESHOLD
+            and best_text < TEXT_CONFIDENCE_THRESHOLD and not lexical_hit):
         return []
     return citations
 
 
 def answer_from_citations(question: str, user_id: str, citations: list[dict[str, Any]],
-                          best_visual: float, best_text: float) -> dict[str, Any]:
+                          best_visual: float, best_text: float,
+                          lexical_hit: bool = False) -> dict[str, Any]:
     """The slow half of the read path (LLM call), split out from retrieve()
     (the fast half) so a caller can act on citations before this runs —
     /ask_stream (src/api/search.py) emits the citations SSE event right after
     retrieve() returns, then calls this, so a client sees grounded citations
     well before the LLM's answer is ready instead of waiting on both together
     the way POST /api/ask (which just calls ask() below) necessarily does."""
-    gated = gate_citations(citations, best_visual, best_text)
+    gated = gate_citations(citations, best_visual, best_text, lexical_hit)
     result: dict[str, Any] = {"question": question, "citations": gated}
 
     if not citations:
@@ -385,4 +468,4 @@ def ask(question: str, user_id: str, *, top_k: int | None = None,
         video_ids: list[str] | None = None) -> dict[str, Any]:
     r = retrieve(question, user_id, top_k=top_k, video_id=video_id, video_ids=video_ids)
     return answer_from_citations(question, user_id, r["citations"],
-                                 r["best_visual"], r["best_text"])
+                                 r["best_visual"], r["best_text"], r["lexical_hit"])
