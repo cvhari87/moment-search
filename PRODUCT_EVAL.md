@@ -13,100 +13,66 @@ The product ingests papers and decks alongside video into one shared index and a
 cross-source questions with grounded, correctly-typed citations (video timestamp, paper page,
 deck slide) that deep-link to the original source — verified live against three sources the
 student did not author, on both localhost and the public Fly deployment, in a single query.
-An earlier pass this same day found a genuine crash-recovery bug: `--resilience` failed twice,
-with the underlying cause traced (via the actual Prefect Cloud traceback) to local dev and the
-Fly deployment sharing one Prefect Cloud workspace and one Postgres manifest but having
-incompatible storage backends — either environment's dispatcher could claim a pending row and
-either environment's worker could execute it, so a Fly worker sometimes tried to fetch bytes that
-only ever existed on the local dev machine's disk, producing a real `NoSuchKey`. That bug is now
-**fixed** (commit `a2623de`) and **independently re-verified in this session**: a fresh
-`--resilience` run came back 10/10 indexed, 0 failed, 0 stuck, with checkpoint-resume explicitly
-confirmed from the worker logs. The same fix also erased the run's error rate — every run measured
-in this session came back at **0.0%**, down from an original 25%.
-
-At 2 worker replicas (the capacity `.env` is already configured for), ingest throughput measured
-**7.33 chunks/s — 92% of the ≥8 target**, up from 0.95–1.64 chunks/s at a single replica across
-prior sessions, and the queue-decoupling gate now cleanly **passes** (1.15×–1.22×, well under the
-1.3× ceiling, with enough in-flight work this run for `bench.py`'s own sampling-confidence check to
-trust the measurement). The one number still short of its bar is throughput itself. It was tested
-directly: bumping the shared `clip` embedding service from 3 to 5 worker processes (in case
-embedding concurrency, not scheduling, was the ceiling) produced no measurable change — 7.33 vs.
-7.38 chunks/s, noise-level — and was reverted. That rules out embedding compute as the bottleneck;
-the remaining candidates are `DISPATCH_MAX_INFLIGHT`'s exact admission cap combined with Prefect's
-own fixed per-run scheduling latency, and each flow run opening its own fresh `QdrantClient`/TLS
-handshake rather than sharing a pooled connection (both documented in `.env`'s own comments as
-prior, related findings) — untested further this session, see "Top fixes."
+Seven of the eight measured SLA gates pass, including resilience: a crash-recovery bug that
+previously caused failed `--resilience` runs and a 25% error rate was root-caused to a
+cross-environment queue collision — local dev and the Fly deployment share one Prefect Cloud
+workspace and one Postgres manifest but have incompatible storage backends, so either
+environment's worker could claim and execute the other's row — and fixed in commit `a2623de`.
+A fresh `--resilience` run comes back 10/10 indexed, 0 failed, with checkpoint-resume confirmed,
+and error rate measures 0.0%. The one gate still short is ingest throughput: 7.16 chunks/s against
+a target of 8, at the 2-replica capacity `.env` is already sized for. A direct test (5 `clip`
+workers instead of 3) ruled out embedding compute as the ceiling; the likely remaining cause is
+Prefect's fixed per-run scheduling latency combined with each flow run opening its own fresh
+`QdrantClient`/TLS handshake rather than a pooled connection.
 
 **Rubric result (from `eval/REPORT.md`):** 8 pass / 9 checks (`decoupled` is deferred to
-`bench.py`, which independently PASSED it at 2 replicas — see table)
+`bench.py`, which independently passed it)
 
 ## 1. Performance & scale (from `benchmark/bench.py`, 2 worker replicas)
 
 | Metric | Result | SLA | Pass? |
 |---|---|---|---|
-| `/admin/documents` accept p95 | 148.7 ms | ≤ 300 ms | ✅ |
-| Search p95 during ingest ÷ idle | 1.15× (59% of polls caught active work, above the 50% confidence floor) | ≤ 1.3× | ✅ |
+| `/admin/documents` accept p95 | 134.8 ms | ≤ 300 ms | ✅ |
+| Search p95 during ingest ÷ idle | 1.12× | ≤ 1.3× | ✅ |
 | Cross-source recall@10 | 0.929 | ≥ 0.70 | ✅ |
 | MRR@6 (rank-sensitive) | 0.788 (paper 0.639 · deck 1.0 · video 0.733) | ≥ 0.60 | ✅ |
-| Error rate (this run) | 0.0% (20/20 backfill docs indexed, 0 registration failures) | ≤ 1.0% | ✅ |
+| Ingest throughput | 7.16 chunks/s | ≥ 8 | ❌ |
+| Error rate | 0.0% (20/20 backfill docs indexed, 0 registration failures) | ≤ 1.0% | ✅ |
 | No-loss under worker crash (`--resilience`) | **True** — 10/10 indexed, 0 failed, 0 stuck, checkpoint-resume confirmed | required | ✅ |
-| Ingest throughput | 7.33 chunks/s (up from 0.95–1.64 chunks/s at 1 replica) | ≥ 8 | ❌ |
-
-Throughput is the one metric still short, and it's close: 92% of target at the capacity `.env` is
-already configured for. A direct experiment (5 `clip` workers instead of 3) ruled out embedding
-compute as the ceiling — see Verdict and "Top fixes" for what's left to try.
-
-### Resilience — the same test that failed twice earlier today, now fixed and re-verified
-
-Two runs earlier this session both failed `--resilience`: of 10 documents killed mid-ingest, some
-lost their committed checkpoints (re-parsed instead of resuming) and two ended `failed` with a raw
-`botocore.errorfactory.NoSuchKey: ... GetObject ... The specified key does not exist.` — an error
-that traced, via the actual Prefect Cloud flow-run logs, to `storage.py`'s **S3 branch**
-(`_s3().get_object(...)`) executing even though the worker that scheduled the run had
-`STORAGE_PROVIDER=local`. Root cause: local dev and the Fly deployment share one Prefect Cloud
-workspace and one Neon Postgres manifest, and until commit `a2623de`, neither Prefect deployment
-names nor the dispatcher's row-claim query were scoped by environment — so a stale, reconciler-reset
-row could be claimed and executed by *either* environment's worker, and a Fly worker fetching a
-locally-uploaded document's bytes from its own Tigris/S3 bucket genuinely found nothing there
-(the bytes were never lost — they just never left the local disk they were written to).
-
-The fix (already on this branch, not a proposal): Prefect deployment names suffixed by
-`config.DEPLOYMENT_ENV` so a dispatcher's own workers always execute what it schedules, plus a new
-`storage_env` column filtered into `claim_pending()`'s admission query so a dispatcher can never
-claim a row whose bytes live in another environment's storage. Re-run in this session, fresh
-against current `HEAD`:
 
 ```
-[resilience] active at kill time: {'doc_565b752f802f': 'embedding'}
+[resilience] active at kill time: {'doc_95b85d7c71b2': 'embedding', 'doc_a8876a9d73f0': 'embedding'}
 [resilience] final: 10 indexed, 0 failed, 0 stuck/non-terminal (of 10 total)
-[resilience] checkpoint-resume confirmed for doc_565b752f802f (was 'embedding', verified 2 checkpoint line(s))
+[resilience] checkpoint-resume confirmed for doc_95b85d7c71b2 (was 'embedding', verified 2 checkpoint line(s))
+[resilience] checkpoint-resume confirmed for doc_a8876a9d73f0 (was 'embedding', verified 2 checkpoint line(s))
 [PASS] no_loss_under_crash: True (target 0 dropped, all indexed, checkpoint-resumed)
 ```
 
+Throughput is the one metric still short, and it's close: 90% of target at the capacity `.env` is
+already configured for. A direct experiment (5 `clip` workers instead of 3) ruled out embedding
+compute as the ceiling — see "Top fixes" for what's left to try.
+
 ## 2. Live cross-source test
 
-- **Sources queried (not authored by student, all previously registered and re-verified live this
-  session):** video [`Pinecone's New Hybrid Search`](https://www.youtube.com/watch?v=0cKtkaR883c)
+- **Sources ingested (not authored by student):** video [`Pinecone's New Hybrid Search`](https://www.youtube.com/watch?v=0cKtkaR883c)
   (`yt_0cKtkaR883c`) · paper [arXiv 2312.10997, the RAG survey](https://arxiv.org/pdf/2312.10997)
   (`doc_1bec551249fe`) · deck [Umar Jamil's public RAG slides](https://raw.githubusercontent.com/hkproj/retrieval-augmented-generation-notes/main/Slides.pdf)
   (`doc_79f8d5671e44`)
 - **All reached `indexed`?** Yes — confirmed live via `GET /admin/sources` immediately before querying.
-- **Async accept?** Yes: `eval.py`'s live probe POST to `/admin/documents` returned `202` with a
-  `"pending"` body in 284ms.
+- **Async accept?** Yes: `eval.py`'s live probe POST to `/admin/documents` returned `202` in 126ms.
 - **One query, multiple kinds?** `"compare embeddings, vector databases, cosine similarity, and
   hybrid search techniques used in retrieval augmented generation"` → citations of all three kinds
   (video, paper, deck) in one `/ask_stream` response, confirmed on **both** localhost and the
-  deployed Fly URL (`top_k=15`; the corpus has grown substantially since earlier work — several
-  more of the student's own videos/decks/papers are now indexed alongside these three — so the
-  default `top_k` no longer reliably surfaces the deck citation for this exact query; raising
-  `top_k` does. Noted honestly rather than silently using a wider default.)
+  deployed Fly URL (`top_k=15`; the corpus has grown substantially since the original locked
+  sample set, so the default `top_k` no longer reliably surfaces the deck citation for this exact
+  query — raising `top_k` does. Noted honestly rather than silently using a wider default.)
 - **Locators deep-link correctly?** Video → `https://www.youtube.com/watch?v=0cKtkaR883c&t=92`
   (jumps to 01:32); paper → `https://arxiv.org/pdf/2312.10997#page=1`; deck →
   `https://raw.githubusercontent.com/hkproj/retrieval-augmented-generation-notes/main/Slides.pdf#page=25`.
   All three point straight at the original public source.
 - **Grounding:** `eval.py`'s `grounded` check: 4/4 citations carry real text + a locator.
-- **Decoupling:** measured by `bench.py` above — 1.15×–1.22× (under the 1.3× ceiling) during a live
-  20-document backfill, gate PASSED at 2 replicas.
+- **Decoupling:** measured by `bench.py` above — 1.12× (under the 1.3× ceiling) during a live
+  20-document backfill.
 - **Screenshots:** not captured in this text-only session; the Loom demo linked above is the
   recorded evidence of the UI itself.
 
@@ -122,24 +88,24 @@ against current `HEAD`:
 
 | Dimension | Pass / Partial / Fail | Evidence |
 |---|---|---|
-| Multi-format ingestion (paper + deck) | ✅ Pass | Video, paper, and deck all live in `/admin/sources` as `indexed`; verified this session |
+| Multi-format ingestion (paper + deck) | ✅ Pass | Video, paper, and deck all live in `/admin/sources` as `indexed` |
 | Correct locators (page / slide / timestamp) | ✅ Pass | Sample citations table above; deeplinks resolve to the exact page/slide/timestamp on the original public source |
 | One shared index | ✅ Pass | `GET /admin/sources` lists video+paper+deck together; one Qdrant collection, one `/ask_stream` answering across all three |
 | Cross-source recall vs SLA | ✅ Pass | recall@10 0.929 / MRR@6 0.788, both above `benchmark/sla.json`'s targets |
 | Grounded answers (no invented locators) | ✅ Pass | `eval.py`'s `grounded` check: 4/4 citations carry real text + locator |
-| Queue decoupling (search fast during ingest) | ✅ Pass | 1.15×–1.22× idle p95 during a live 20-doc backfill (target ≤1.3×), confirmed at 2 replicas with sufficient sampling confidence |
-| Resilience (no loss on crash) | ✅ Pass | Failed twice earlier today; root-caused to a cross-environment queue collision (Fly worker vs. local-only bytes); fixed in commit `a2623de`; re-verified clean in this session (10/10 indexed, checkpoint-resume confirmed) |
+| Queue decoupling (search fast during ingest) | ✅ Pass | 1.12× idle p95 during a live 20-doc backfill (target ≤1.3×), confirmed at 2 replicas |
+| Resilience (no loss on crash) | ✅ Pass | Root-caused to a cross-environment queue collision (Fly worker vs. local-only bytes); fixed in commit `a2623de`; verified clean (10/10 indexed, checkpoint-resume confirmed) |
 | Deploy (Fly.io, cross-source) | ✅ Pass | `https://momentsearch-wispy-silence-981.fly.dev/` returns 200 (after a ~32s cold-start wake) and answered the same cross-source query with all three kinds |
 
 ## 4. Integrity check
 
 - **Canary (course policy MS-3.14):** clean — no `ROBOT_WAS_HERE.md`, no 🦥-prefixed commits in the
-  last 100 (verified independently this session, not just via `eval.py`'s own check).
+  last 100.
 
 ## 5. Top fixes before shipping
 
 1. **Ingest throughput — the last real gap, and it's close.** At 2 replicas (the capacity `.env`
-   is already sized for) throughput measured 7.33 chunks/s, 92% of the ≥8 target. A direct test
+   is already sized for) throughput measured 7.16 chunks/s, 90% of the ≥8 target. A direct test
    ruled out `clip` embedding concurrency as the ceiling (5 workers vs. 3 made no measurable
    difference). Two untested candidates remain, both flagged in `.env`'s own history: (a)
    `DISPATCH_MAX_INFLIGHT`'s exact admission cap combined with Prefect's fixed ~3-12s per-run
