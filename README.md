@@ -2,7 +2,7 @@
 
 **Ask questions about your videos and get answers grounded in the exact moments — by what's _seen_ on screen, and (for YouTube) what's _said_ in the transcript.**
 
-🌐 **Live app:** [momentsearch.fly.dev](https://momentsearch.fly.dev/get-started)
+🌐 **Live app:** [momentsearch.fly.dev](https://momentsearch.fly.dev/get-started) · 🎥 **Demo video:** [watch on Loom](https://www.loom.com/share/d9d10e4ca7c5448eb9ab2a7b6db619f4) — a live walkthrough asking one question across a video, a research paper, and a slide deck, and getting back a single grounded answer with correctly-typed citations (timestamp / page / slide) that deep-link straight to the original source.
 
 MomentSearch is an open-source, production-shaped stack for **visual** video
 search and RAG. Users upload videos (or paste YouTube URLs); background workers
