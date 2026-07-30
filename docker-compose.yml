@@ -22,6 +22,11 @@ services:
     # parallel embedding. Not higher: each process loads its own full model
     # copy (~1.4GB measured), and this container's memory limit is shared
     # with api/worker/worker on one Docker Desktop VM.
+    # Tried 5 workers to test whether clip-side embedding concurrency was
+    # capping ingest throughput at 2 worker replicas: no change (7.33 ->
+    # 7.38 chunks/s, noise-level) — ruled out, the ceiling is elsewhere
+    # (likely DISPATCH_MAX_INFLIGHT's admission cap / per-run Prefect +
+    # Qdrant-connection overhead, not embedding compute). Reverted to 3.
     command: uvicorn src.clip_service:app --host 0.0.0.0 --port 8001 --workers 3
     env_file: .env
     environment:
