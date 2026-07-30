@@ -310,8 +310,10 @@ DECK_SLIDE_RENDER_DPI = _int("DECK_SLIDE_RENDER_DPI", 150)
 RRF_K = _int("RRF_K", 60)
 # Hits from either branch within this many seconds are the SAME moment.
 FUSION_WINDOW_S = _float("FUSION_WINDOW_S", 15.0)
-# When a window has BOTH a frame and a transcript hit, multiply its score —
-# two independent modalities agreeing is the strongest relevance signal.
+# A window with BOTH a frame and a trustworthy transcript hit earns summed
+# two-branch RRF plus this multiplier. CROSS_MODAL_TEXT_MIN below (defined
+# after TEXT_CONFIDENCE_THRESHOLD, which it defaults from) decides whether
+# the pair is trustworthy; otherwise it competes as its strongest branch.
 CROSS_MODAL_BOOST = _float("CROSS_MODAL_BOOST", 1.5)
 # Per-branch candidates fetched before fusion.
 BRANCH_TOP_K = _int("BRANCH_TOP_K", 20)
@@ -380,7 +382,6 @@ QDRANT_HNSW_ON_DISK = _envbool("QDRANT_HNSW_ON_DISK", True)
 
 # --- Retrieval / faithfulness ------------------------------------------------------
 TOP_K = _int("TOP_K", 6)                 # frames fed to the multimodal LLM (3-8)
-KNN_K = _int("KNN_K", 24)                # candidates fetched before trimming to TOP_K
 # Gate 1: abstain WITHOUT calling the LLM if BOTH branches' best raw score is
 # below their threshold. Fusion scores are RRF (tiny), so the gate uses each
 # branch's own raw cosine. Calibrated 2026-07-29 via benchmark/
@@ -397,6 +398,24 @@ KNN_K = _int("KNN_K", 24)                # candidates fetched before trimming to
 # script after growing either query set; these are not meant to be static.
 CONFIDENCE_THRESHOLD = _float("CONFIDENCE_THRESHOLD", 0.28)              # visual (CLIP)
 TEXT_CONFIDENCE_THRESHOLD = _float("TEXT_CONFIDENCE_THRESHOLD", 0.72)  # transcript (bge)
+
+# Cross-modal eligibility: a frame+text window only earns the second branch's
+# RRF contribution and CROSS_MODAL_BOOST if the TEXT hit's own raw score
+# clears this bar. Text-only, deliberately — the
+# calibration note above already establishes CLIP's 0.23-0.33 band carries
+# no relevance signal AT ALL on this corpus, so gating on the frame's score
+# too would strip the boost from good pairs and admit bad ones at roughly
+# random, without targeting the actual failure. Diagnosed live
+# (WHAT_I_DID.md, LEARNINGS.md "cross-modal boost" entries): an unrelated
+# frame (0.23) paired with a merely-weak text hit (0.58, below
+# TEXT_CONFIDENCE_THRESHOLD) got boosted 1.5x above a genuinely relevant
+# text-only match (0.69, no nearby frame so no boost). Seeded from
+# TEXT_CONFIDENCE_THRESHOLD (already calibrated, not a new guessed number)
+# but kept as its own constant since it answers a different question — "is
+# THIS window's text hit trustworthy" vs. "is there anything relevant
+# anywhere" — and may need to diverge once there's ranking-specific data
+# (see benchmark/bench.py's measure_ranking).
+CROSS_MODAL_TEXT_MIN = _float("CROSS_MODAL_TEXT_MIN", TEXT_CONFIDENCE_THRESHOLD)
 
 # --- Multimodal LLM (answer synthesis only — retrieval works without it) -----------
 # LLM_PROVIDER: openai | nvidia | anthropic ("openai" also covers any

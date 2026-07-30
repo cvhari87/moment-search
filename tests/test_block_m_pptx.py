@@ -506,6 +506,27 @@ class TParseConversionCheckpointTests(unittest.TestCase):
                      if c.kwargs.get("view_storage_key") == conv_key]
         self.assertEqual(len(persisted), 1)
 
+    def test_cached_pptx_with_oversized_viewer_cannot_resume_as_indexable(self):
+        """Parsed text alone is not a complete PPTX ingest result: citations
+        also require a browser-viewable derivative. If that derivative now
+        violates the configured cap, fail instead of returning cached pages
+        that the flow would subsequently mark indexed without a viewer key."""
+        parsed = b'[{"page": 1, "text": "hello"}]'
+        storage_mock = MagicMock()
+        storage_mock.exists.return_value = True
+        storage_mock.get_bytes.return_value = parsed
+        storage_mock.head.return_value = {
+            "size": document._MAX_CONVERTED_BYTES + 1,
+        }
+
+        with patch.multiple(document, storage=storage_mock, db=MagicMock()):
+            with self.assertRaises(document.PermanentDocumentError) as ctx:
+                document.t_parse.fn(
+                    "doc1", "user1", None, "deck", 1,
+                    storage_key="documents/user1/x.pptx")
+
+        self.assertIn("converted PDF checkpoint exceeds", str(ctx.exception))
+
 
 def _minimal_pdf_bytes(n_pages: int) -> bytes:
     """A real, fitz-openable PDF with `n_pages` blank pages — used to

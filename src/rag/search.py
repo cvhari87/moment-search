@@ -1,11 +1,12 @@
 """Read path: question -> retrieve -> gate -> cited answer (or honest abstain).
 
 Retrieval is milliseconds; the multimodal LLM call is seconds and dominates
-cost. So the shape is a confidence funnel: fetch KNN_K candidates, collapse
-temporal near-duplicates, trim to TOP_K, and — Gate 1 — if even the best
-score is below CONFIDENCE_THRESHOLD, abstain WITHOUT calling the LLM. That
-one free check kills most hallucination risk. Generated answers get their
-[n] citations validated; invented references are stripped.
+cost. So the shape is a confidence funnel: fetch BRANCH_TOP_K candidates per
+branch, fuse and collapse temporal near-duplicates, trim to TOP_K, and —
+Gate 1 — if even the best score is below CONFIDENCE_THRESHOLD, abstain
+WITHOUT calling the LLM. That one free check kills most hallucination risk.
+Generated answers get their [n] citations validated; invented references
+are stripped.
 """
 from __future__ import annotations
 
@@ -17,6 +18,7 @@ from typing import Any
 from .. import config, db, llm, storage
 from ..ingest import detect
 from ..config import (BRANCH_TOP_K, CONFIDENCE_THRESHOLD, CROSS_MODAL_BOOST,
+                      CROSS_MODAL_TEXT_MIN,
                       DOCUMENT_FETCH_ALLOWED_INTERNAL_HOSTS, FUSION_WINDOW_S,
                       RRF_K, TEXT_CONFIDENCE_THRESHOLD, TOP_K)
 from . import vector_store
@@ -112,9 +114,21 @@ def _fuse(visual_hits: list[dict], text_hits: list[dict]) -> list[dict]:
     proximity (within FUSION_WINDOW_S seconds of each other, same video) into
     one 'moment'; document hits bucket by EXACT page/slide match instead (see
     _locator) since there's no timeline to be "close" on. Windows sum their
-    rrf, and boost when BOTH modalities agree — two independent signals
-    pointing at the same instant is the strongest evidence (documents only
-    ever populate the text slot; there is no CLIP frame branch for a PDF).
+    RRF only when BOTH modalities agree AND the text hit is itself confident
+    (score >= CROSS_MODAL_TEXT_MIN), then apply the boost. An unqualified
+    pair competes as its strongest single branch. Two signals pointing at
+    the same instant are only evidence if one actually says something
+    relevant. Presence alone isn't enough: CLIP's
+    visual similarity on this corpus sits in a narrow, non-discriminating
+    band (~0.23-0.33) regardless of query relevance, so a generic frame
+    from almost any video clears the visual top-K for almost any query;
+    without a confidence floor on the paired text hit, that generic frame
+    plus any weakly-overlapping caption got boosted above a genuinely
+    relevant text-only match that had no nearby frame to pair with — a
+    live, diagnosed bug (see WHAT_I_DID.md / LEARNINGS.md "cross-modal
+    boost" entries). Gating on the frame's own score too would not help
+    (same non-discriminating band, see config.py's CONFIDENCE_THRESHOLD
+    comment), so only the text side is checked.
     """
     def ranked(hits, modality):
         out = []
@@ -149,13 +163,29 @@ def _fuse(visual_hits: list[dict], text_hits: list[dict]) -> list[dict]:
         if w[slot] is None:
             w[slot] = h
     for w in windows:
-        # Score = best frame + best transcript hit; ×boost when BOTH modalities
-        # agree at this instant (two independent signals = strongest evidence).
-        w["rrf"] = (w["frame"]["rrf"] if w["frame"] else 0.0) + \
-                   (w["text"]["rrf"] if w["text"] else 0.0)
-        if {"frame", "text"} <= w["modalities"]:
-            w["rrf"] *= CROSS_MODAL_BOOST
-    windows.sort(key=lambda w: w["rrf"], reverse=True)
+        frame_rrf = w["frame"]["rrf"] if w["frame"] else 0.0
+        text_rrf = w["text"]["rrf"] if w["text"] else 0.0
+        qualified_pair = ({"frame", "text"} <= w["modalities"]
+                          and w["text"]["score"] >= CROSS_MODAL_TEXT_MIN)
+        if qualified_pair:
+            # Only a trustworthy pair earns BOTH the second branch's RRF
+            # contribution and the agreement bonus.
+            w["rrf"] = (frame_rrf + text_rrf) * CROSS_MODAL_BOOST
+        else:
+            # Presence is not corroboration. Keep the window's strongest
+            # branch, but do not let a generic frame + weak text sum
+            # structurally outrank every single-branch document result.
+            w["rrf"] = max(frame_rrf, text_rrf)
+    # RRF ties are common (e.g. each branch's rank-1 result). Break them with
+    # the text branch's own raw score, which is comparable across text hits
+    # and calibrated on this corpus; never compare it numerically with CLIP.
+    windows.sort(
+        key=lambda w: (
+            w["rrf"],
+            w["text"]["score"] if w["text"] else float("-inf"),
+        ),
+        reverse=True,
+    )
     return windows
 
 

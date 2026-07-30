@@ -636,6 +636,54 @@ def measure_recall(top_k: int = 10) -> tuple[float, float]:
     return recall, error_rate
 
 
+def measure_ranking(top_k: int = 6) -> tuple[float, dict, float]:
+    """MRR@`top_k` on the same labeled queries as measure_recall(), but
+    scored on RANK, not just presence: 1/rank of the first citation matching
+    the gold kind/source_id/locator among the top `top_k` results, 0 if
+    absent. recall@10 is blind to ordering — a gold citation buried at rank
+    9 counts the same as rank 1 — so it never flags a ranking regression
+    where the right answer is present but outranked by irrelevant results
+    (exactly what "trust"/"leadership" showed live: recall@10 passed both
+    while the top-ranked citations were wrong). Uses TOP_K (6, the app's own
+    real default) rather than recall@10's padded 10, since that's what a
+    user actually sees. Returns (mrr, per_kind breakdown, error_rate) — the
+    per-kind split matters because queries.jsonl only has 3 video-kind
+    queries out of 14, so an aggregate number alone can hide a regression
+    concentrated in one kind."""
+    _ensure_recall_corpus()
+    lines = (ROOT / "benchmark" / "queries.jsonl").read_text().splitlines()
+    queries = [json.loads(l) for l in lines if l.strip()]
+
+    expected_ids = {
+        "paper": _doc_id(RECALL_USER, PAPER_URI),
+        "deck": _doc_id(RECALL_USER, DECK_URI),
+    }
+    by_kind: dict[str, list[float]] = {}
+    errors = 0
+    for q in queries:
+        kind = q["kind"]
+        expected_source_id = expected_ids.get(kind, q["source_id"])
+        ms, citations = _ask_stream_first_event(q["query"], RECALL_USER, top_k=top_k)
+        if ms == float("inf"):
+            errors += 1
+        rank_found = None
+        for rank, c in enumerate(citations[:top_k], 1):
+            if (c.get("kind") == kind and c.get("sourceId") == expected_source_id
+                    and _locator_matches(kind, c.get("locator") or {}, q["locator"])):
+                rank_found = rank
+                break
+        rr = 1.0 / rank_found if rank_found else 0.0
+        by_kind.setdefault(kind, []).append(rr)
+        label = f"rank {rank_found}" if rank_found else "MISS"
+        print(f"  [{label:<7}] {q['query'][:70]}")
+    all_scores = [s for v in by_kind.values() for s in v]
+    n = len(queries)
+    mrr = sum(all_scores) / len(all_scores) if all_scores else 0.0
+    per_kind = {k: round(sum(v) / len(v), 3) for k, v in by_kind.items()}
+    error_rate = errors / n if n else 0.0
+    return mrr, per_kind, error_rate
+
+
 # ── --resilience ──────────────────────────────────────────────────────────────
 
 def _verify_checkpoint_resume(targets: dict[str, str]) -> bool:
@@ -913,6 +961,16 @@ def main():
     recall, error_rates["recall"] = measure_recall(top_k=10)
     gate("recall_at_10", round(recall, 3), recall >= SLA["recall_at_10_min"],
          SLA["recall_at_10_min"])
+
+    # 3b. MRR@6 — rank-sensitive, catches ranking regressions recall@10
+    # can't (see measure_ranking's docstring). This is a hard SLA gate: the
+    # 0.60 floor in sla.json was set from the measured 0.717 baseline with
+    # margin, rather than guessed before a real run.
+    print("[ranking] running labeled queries (top_k=6, rank-sensitive)...")
+    mrr, mrr_by_kind, error_rates["ranking"] = measure_ranking(top_k=6)
+    mrr_target = SLA["mrr_at_6_min"]
+    gate("mrr_at_6", round(mrr, 3), mrr >= mrr_target, mrr_target)
+    print(f"  (by kind: {json.dumps(mrr_by_kind)})")
 
     # 5. error rate — never silently absorbed into other numbers. A
     # guardrail review reproduced a run where 39/40 failed searches still

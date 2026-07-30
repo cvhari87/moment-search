@@ -33,6 +33,50 @@ def _rows(**id_to_status: str) -> dict[str, dict]:
     return {i: {"id": i, "status": s, "chunk_count": 10} for i, s in id_to_status.items()}
 
 
+class RankingMetricTests(unittest.TestCase):
+    def test_mrr_uses_first_matching_rank_and_reports_errors_by_query(self):
+        queries = (
+            '{"query":"paper q","kind":"paper","source_id":"ignored",'
+            '"locator":{"page":3}}\n'
+            '{"query":"video q","kind":"video","source_id":"video-1",'
+            '"locator":{"start_ms":1000,"end_ms":2000}}\n'
+        )
+        expected_paper = bench._doc_id(bench.RECALL_USER, bench.PAPER_URI)
+        paper_results = [
+            {"kind": "paper", "sourceId": "wrong", "locator": {"page": 3}},
+            {"kind": "paper", "sourceId": expected_paper, "locator": {"page": 3}},
+        ]
+
+        with mock.patch.object(bench, "_ensure_recall_corpus"), \
+             mock.patch.object(pathlib.Path, "read_text", return_value=queries), \
+             mock.patch.object(
+                 bench, "_ask_stream_first_event",
+                 side_effect=[(10.0, paper_results), (float("inf"), [])]):
+            mrr, by_kind, error_rate = bench.measure_ranking(top_k=6)
+
+        self.assertEqual(mrr, 0.25)  # (rank-2 reciprocal + miss) / 2
+        self.assertEqual(by_kind, {"paper": 0.5, "video": 0.0})
+        self.assertEqual(error_rate, 0.5)
+
+    def test_main_exits_nonzero_when_mrr_misses_its_sla(self):
+        decoupling = (1.0, True, 9.0, True, set(), 0.0, 0.0, 0.0, 0.0)
+        with mock.patch.object(sys, "argv", ["bench.py"]), \
+             mock.patch.object(bench, "measure_accept_latency",
+                               return_value=(100.0, set(), 0.0)), \
+             mock.patch.object(bench, "_wait_terminal", return_value={}), \
+             mock.patch.object(bench, "measure_decoupling_and_throughput",
+                               return_value=decoupling), \
+             mock.patch.object(bench, "measure_recall", return_value=(1.0, 0.0)), \
+             mock.patch.object(bench, "measure_ranking", return_value=(0.59, {}, 0.0)), \
+             mock.patch.object(bench, "_cleanup"), \
+             redirect_stdout(io.StringIO()) as out:
+            with self.assertRaises(SystemExit) as ctx:
+                bench.main()
+
+        self.assertEqual(ctx.exception.code, 1)
+        self.assertIn("[FAIL] mrr_at_6", out.getvalue())
+
+
 class ResilienceFalsePassTests(unittest.TestCase):
     """The guardrail's reproduction: 10 documents requested, 9 fail to
     register, the 1 survivor is killed mid-'parsing' (no checkpoint exists),

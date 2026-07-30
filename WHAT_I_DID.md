@@ -828,8 +828,9 @@ clear-margin pass is stronger than reverting to an equally-unvalidated older num
     manifest row. This removes the remaining S3/GCS `HEAD` request from every PPTX citation.
   - Documented the conversion timeout, converted-byte cap, and converted-page cap in `.env.example`,
     with focused regression coverage for each new failure boundary.
-  - Final verification: Block M 40/40, complete repository suite 80/80, benchmark suite 17/17;
-    `git diff --check` and Python compilation also passed.
+  - Final verification at that point: Block M 40/40, complete repository suite 80/80, benchmark
+    suite 17/17; `git diff --check` and Python compilation also passed. Later guardrail fixes raised
+    these counts; see the newer entries below.
 - [ ] **Block J:** create or select the permanent Fly app and update both `fly.toml`'s `app` value
   and `CLIP_SERVICE_URL` to the same app name.
 - [ ] **Block J:** verify the intended GitHub deployment branch after `fly launch`; it may rewrite
@@ -839,8 +840,7 @@ clear-margin pass is stronger than reverting to an equally-unvalidated older num
 - [ ] **Block J:** the deck's registered URI (`http://api:8000/...`) is docker-compose-internal —
   will need re-registering under Fly's internal or public hostname after redeploy, which will
   also change its `doc_id` (expected; see Block H's register-and-capture design above).
-- [ ] Minor, deferred: per-slide caption checkpointing and independent verification of the
-  `c2af9c7` legacy-row migration (see guardrail review above).
+- [ ] Minor, deferred: per-slide caption checkpointing.
 
 ## 2026-07-29 — UI fix: no discoverable path to the upload flow from the sample page
 
@@ -919,3 +919,94 @@ correctly abstain, 14/14 positives still pass, and "leadership"/"leadership run"
 grounded citations and a real synthesized answer live. Added `tests/test_lexical_gate.py` (17
 tests) covering `_significant_words`, `_lexical_hit` (including the ANY-vs-ALL regression case
 directly), and `gate_citations`'s three-way OR-pass.
+
+## 2026-07-29 — Ranking quality: unqualified cross-modal boost, general case
+
+Status: **complete**
+
+User reported "trust" and "leadership" queries ranking a generic "LLM explained briefly" video and
+a neural-network explainer clip above genuinely on-topic content (a "Trust in Action" deck, "The
+Hard Part of AI"'s actual trust discussion, "Leadership Run Amok" pages) — screenshots showed
+frame-only ("seen") citations from those two clips occupying half the top-6 slots for both queries,
+plus an unrelated "Pinecone's New Hybrid Search" frame surfacing for "trust".
+
+This is the SAME bug class as the `[Music]`-filler cross-modal-boost bug fixed earlier today, but
+the general case that fix didn't close: `_fuse()`'s `CROSS_MODAL_BOOST` (`src/rag/search.py`) still
+had no confidence check on the paired hit, it just multiplies a window's score by 1.5x whenever a
+frame and a text hit land within `FUSION_WINDOW_S` of each other. The earlier fix only removed one
+SOURCE of low-quality text hits (non-speech caption artifacts); it didn't change the fusion logic
+itself, so any OTHER weak-but-real text hit paired with a generic frame reproduces the same failure
+mode. And these two videos' frames are genuinely generic on this corpus — CLIP's visual similarity
+sits in a narrow, non-discriminating band (~0.23-0.33) regardless of query relevance (see
+`config.py`'s `CONFIDENCE_THRESHOLD` calibration comment), so their frames clear the visual top-20
+candidate list for almost any query, and any weak vocabulary overlap in a nearby caption was enough
+to trigger the boost.
+
+Fix: qualify the entire two-branch score on the paired TEXT hit's own raw score, via a new
+`CROSS_MODAL_TEXT_MIN` constant (`src/config.py`, defaults to the already-calibrated
+`TEXT_CONFIDENCE_THRESHOLD`, kept as its own named constant since it answers a different question
+and may need to diverge with more data). Deliberately did NOT also gate on the frame's own score —
+the calibration comment already establishes CLIP's band carries no relevance signal at all, so
+gating on it would strip the boost from good pairs and admit bad ones at roughly random, targeting
+nothing. A below-threshold pair now competes as its strongest single branch; otherwise merely
+adding its two RRF terms would still structurally outrank every document-only hit even without the
+multiplier. Added `tests/test_fuse_boost.py` (7 tests) directly exercising `_fuse()`'s scoring and
+cross-window ordering —
+no test had covered that function before. Also removed dead `KNN_K` config (never referenced
+outside its own definition; `search.py`'s module docstring falsely claimed retrieval "fetch[es]
+KNN_K candidates" when it actually uses `BRANCH_TOP_K`) and fixed that docstring.
+
+Before fixing, added a rank-sensitive eval metric that didn't exist: `benchmark/bench.py`'s
+`measure_recall()` is a binary "is the gold citation present anywhere in the top 10" check — both
+"trust" and "leadership" would have PASSED it even with the bug present, since the correct citation
+was always in the result set, just outranked. Added `measure_ranking()` (MRR@6, the app's real
+`TOP_K`, with a per-query-kind breakdown since the labeled set only has 3 video-kind queries out of
+14) and wired it into `main()`'s gate sequence. Measured before and after on the existing 14 labeled
+queries: `recall@10` and `MRR@6` were IDENTICAL pre/post fix (0.929 / 0.717) — none of those queries
+happen to trigger this bug, so this fix is a pure precision improvement the existing labeled set
+can't see, not something `bench.py` alone could have validated. Set `sla.json`'s new
+`mrr_at_6_min: 0.60` from the measured 0.717 baseline (with margin), not a guessed number.
+
+Verified live against the exact reported queries after rebuilding and restarting the `api`/`worker`
+containers: "trust" now returns 3 citations, all text-branch, all genuinely on-topic (two "Trust in
+Action" slides, "The Hard Part of AI"'s actual trust discussion) — the LLM-explainer clip,
+neural-network clip, and Pinecone frame are gone entirely, not just reordered. "leadership" now
+returns "Leadership Run Amok" pages 6 and 8 at ranks 1-2 (previously rank 2-3, sharing the page with
+an irrelevant clip at rank 1), plus "The Hard Part of AI" at rank 3; both generic clips are gone.
+Ran the full `benchmark/bench.py` suite afterward: all ranking-relevant gates pass
+(`recall_at_10`, the new `mrr_at_6`, `error_rate_max_pct`, `search_p95_during_ingest_ratio`); the
+only failure, `ingest_throughput_chunks_per_s` (4.36 vs target 8), is unrelated ingestion-pipeline
+throughput on this machine, not a regression from this change.
+
+A cross-encoder reranker (`README.md`'s own "later, under real load" roadmap item) was scoped as a
+possible follow-up but deliberately NOT built — the boost fix alone resolved both reported cases
+cleanly, and building a second-stage model on top of an already-fixed bug would have added latency
+and a new failure mode without a demonstrated remaining gap. Left as an explicit future item if a
+gap shows up on a broader/harder query set.
+
+**Closing guardrail follow-up:** review caught that gating only the explicit multiplier was
+insufficient: the unconditional sum of two RRF terms still made every weak frame+text pair score
+above every single-branch document result. Below-threshold pairs now compete as their strongest
+branch, with calibrated text confidence breaking equal-RRF ties. A deterministic cross-window test
+locks down the exact weak-video-versus-strong-document ordering. The same review restored the Block
+M invariant that cached parsed PPTX text cannot resume toward `indexed` when its viewer PDF violates
+the configured cap; doing so would leave `view_storage_key` null and citations falling back to raw
+PPTX bytes. `.env.example` now removes dead `KNN_K` and documents `CROSS_MODAL_TEXT_MIN`, while the
+MRR metric and hard-gate control flow have dedicated benchmark tests. Final verification after the
+fixes: repository 89/89, benchmark guardrails 19/19, compilation and diff checks clean; rebuilt-live
+MRR@6 = 0.788 (paper 0.639, deck 1.0, video 0.733), and the existing PPTX citation still returned
+`206 application/pdf` with `%PDF-1.7` bytes.
+
+**Known follow-up (deferred, not started):** after the above fix, "leadership" still showed "Large
+Language Models explained briefly" at rank 1, ahead of "Leadership Run Amok" pages 6/8 (screenshot
+from live app). Its score (0.0167) is NOT boosted — it equals a plain rank-1 single-branch RRF value
+(`1/(RRF_K+0)`), the same value the Leadership page-6 text hit has. Working hypothesis: this is a
+**tie**, not a repeat of the cross-modal-boost bug. Pure RRF encodes only *rank within a branch*, not
+match *magnitude* — a generic CLIP frame that happens to be the visual branch's rank-1 hit scores
+identically to a genuinely relevant text hit that's the text branch's rank-1 hit, even though one is
+confident-and-wrong and the other confident-and-right. Whatever's breaking the tie today favors the
+frame window. Not yet root-caused against real window-level debug output (would need to log each
+window's `modalities`/`rrf`/branch composition for this exact query to confirm vs. some other
+mechanism). Candidate directions: magnitude-aware fusion (blend raw score into the RRF sum, not just
+rank) or an explicit tie-break preferring text over frame-only windows. Deferred at user's request
+("in the interest of time, maybe we tackle this later") — not investigated further this session.

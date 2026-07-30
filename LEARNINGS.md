@@ -1391,3 +1391,41 @@ is only as sound as its weakest input's SEMANTIC validity, not just its presence
 list — filtering degenerate/non-content inputs at the SOURCE (here, transcript ingestion) is a more
 robust fix than trying to make the combination logic defensive against every way an individual
 input could be meaningless.
+
+**Follow-up, same day: source-filtering only closes the instance, not the class.** The above fix
+removed `[Music]`/`[Applause]` filler from the text branch, which closed THAT specific bug — but
+`_fuse()`'s boost logic itself still had no confidence check, so any OTHER weak-but-real text hit
+(not filler, just genuinely tangential to the query) paired with a generic frame reproduced the
+identical failure mode. It surfaced again the same day on different queries ("trust", "leadership")
+against different videos. Source-side filtering is the right fix for a specific, enumerable class of
+garbage input (bracket tags have a clean, unambiguous signature); it is NOT a substitute for making
+the combination logic itself defensive when the failure mode is general (any weak signal, not a
+specific known-bad pattern) — eventually the combination logic needs its own confidence floor
+regardless of how clean the inputs are upstream. Second fix: gate the boost directly on the paired
+hit's own raw score (`CROSS_MODAL_TEXT_MIN` in `src/config.py`), not on filtering what can become an
+input in the first place. The confidence check must qualify the whole combination, not only its
+explicit multiplier: summing two RRF terms already guarantees a paired window outranks any
+single-branch document result. Below the floor, retain only the strongest branch score. Also
+notable: only ONE of the two signals needed a confidence floor here,
+not both — CLIP's visual similarity on this corpus doesn't discriminate by relevance at all (a
+~0.23-0.33 band regardless of query), so gating on the frame's score too would have added noise, not
+signal. When adding a confidence check to a multi-signal fusion step, check whether each signal is
+actually discriminative on your data before assuming symmetric treatment is correct.
+
+## An eval metric can be blind to exactly the regression it should catch
+
+`benchmark/bench.py`'s `measure_recall()` (recall@10: is the gold citation present ANYWHERE in the
+top 10) passed cleanly on both "trust" and "leadership" the whole time the cross-modal-boost bug was
+live — the correct citation was always in the result set, just buried below irrelevant ones. A
+presence/recall metric structurally cannot detect a ranking-quality regression where nothing is
+missing, only misordered; it will stay green through the exact bug a user experiences as "the search
+results are wrong." Rank-sensitive metrics (MRR, nDCG) and presence metrics (recall@k) answer
+different questions and neither substitutes for the other — a retrieval eval suite needs both, and a
+"the app now behaves better" claim needs to be checked against the rank-sensitive one specifically,
+not inferred from an unchanged recall number. Corollary: after adding the rank-sensitive metric here
+and re-measuring, MRR@6 was IDENTICAL before and after the fix on the existing 14-query labeled
+set — none of those queries happened to trigger this particular bug, meaning even a rank-sensitive
+metric only catches what its labeled query set actually exercises. A benchmark's blind spots are
+defined by its query set's coverage, not just by which metric it computes; a fix validated only
+against `bench.py` numbers, without also manually replaying the actual reported queries, would have
+shipped without any automated signal that it worked.
