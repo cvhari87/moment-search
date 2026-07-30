@@ -44,7 +44,8 @@ from . import config, db, jobs
 def dispatch_once() -> int:
     """Admit as many pending sources as free capacity allows, in
     ENABLE_FAIR_DISPATCH order. Returns how many were dispatched this tick."""
-    claimed = db.claim_pending(config.DISPATCH_MAX_INFLIGHT, fair=config.ENABLE_FAIR_DISPATCH)
+    claimed = db.claim_pending(config.DISPATCH_MAX_INFLIGHT, fair=config.ENABLE_FAIR_DISPATCH,
+                               env=config.DEPLOYMENT_ENV)
     for row in claimed:
         try:
             if row.get("kind", "video") == "video":

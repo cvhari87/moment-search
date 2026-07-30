@@ -29,6 +29,7 @@ from ..config import (
     ADMIN_TOKEN,
     ALLOWED_UPLOAD_TYPES,
     DEFAULT_USER_ID,
+    DEPLOYMENT_ENV,
     INFLIGHT_STATUSES,
     MAX_UPLOAD_MB,
     UPLOAD_KEY_PREFIX,
@@ -126,6 +127,10 @@ def register(req: RegisterRequest, uid: str = Depends(user_id)):
         row = db.upsert_pending({"id": video_id, "user_id": uid, "source": "youtube",
                                  "url": req.url, "storage_key": None,
                                  "source_hash": video_id, "title": req.title})
+        # YouTube fetches happen fresh over HTTPS at ingest time and never
+        # touch our own storage, so no storage_env pin — any environment's
+        # worker can run this one (see db.claim_pending / the column's
+        # comment in db.SCHEMA).
     elif req.video_id and req.key:
         # Never trust the client's key: it must be the one WE minted for them.
         if not req.key.startswith(f"{UPLOAD_KEY_PREFIX}{uid}/{req.video_id}"):
@@ -139,7 +144,8 @@ def register(req: RegisterRequest, uid: str = Depends(user_id)):
         title = req.title or Path(req.key).stem
         row = db.upsert_pending({"id": req.video_id, "user_id": uid, "source": "upload",
                                  "url": None, "storage_key": req.key,
-                                 "source_hash": None, "title": title})
+                                 "source_hash": None, "title": title,
+                                 "storage_env": DEPLOYMENT_ENV})
     else:
         raise HTTPException(400, "Provide either url (YouTube) or video_id+key (upload).")
 

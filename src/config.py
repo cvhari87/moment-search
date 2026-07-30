@@ -126,6 +126,26 @@ ENABLE_FAIR_DISPATCH = _envbool("ENABLE_FAIR_DISPATCH", True)
 DISPATCH_MAX_INFLIGHT = _int("DISPATCH_MAX_INFLIGHT", _int("WORKER_CONCURRENCY", 2))
 DISPATCH_INTERVAL_S = _float("DISPATCH_INTERVAL_S", 3.0)  # how often the dispatcher tops up
 
+# --- Deployment isolation (Prefect Cloud is one shared workspace) -------------
+# Local dev and the Fly.io deployment point at the SAME Prefect Cloud workspace
+# (PREFECT_API_URL/KEY are copied verbatim into `fly secrets`) but have
+# INCOMPATIBLE storage backends (local disk vs. Tigris/S3). flow.serve()'s
+# runner has no concept of "environment" — any connected runner can pick up
+# any scheduled run for a given deployment name, so a document backfilled
+# locally could be executed by the Fly worker (or vice versa). Found live: a
+# `parse-document` task burning its full retries=2 backoff (~2.5 minutes)
+# before failing with a genuine botocore NoSuchKey — the traceback rooted in
+# storage.py's `_s3().get_object()` even though THAT process's own
+# STORAGE_PROVIDER is "local", because the Fly worker had won the race for a
+# flow run whose bytes only exist on the dev machine's disk. This was the
+# actual ceiling on ingest throughput, not local CPU/embedding capacity —
+# scaling worker replicas or CLIP processes never touched it since the
+# competing capacity was external. FLY_APP_NAME is set automatically on every
+# Fly Machine and absent everywhere else, so it doubles as a free per-
+# environment id: suffixing every deployment name with it means each
+# environment's dispatcher only ever schedules runs its OWN workers can serve.
+DEPLOYMENT_ENV = os.getenv("FLY_APP_NAME", "local").strip() or "local"
+
 # --- Crash safety / reconciler (Block G) ---------------------------------------
 # Prefect's @task(retries=N) only catches an in-process exception — a hard-killed
 # worker (docker kill, OOM, host crash) leaves a row stuck in an in-flight status

@@ -12,7 +12,7 @@ from typing import Any
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
-from .config import DATABASE_URL, INFLIGHT_STATUSES
+from .config import DATABASE_URL, DEPLOYMENT_ENV, INFLIGHT_STATUSES
 
 _pool: ConnectionPool | None = None
 _pool_pid: int | None = None
@@ -88,6 +88,24 @@ CREATE INDEX IF NOT EXISTS ms_videos_kind_idx ON ms_videos (kind);
 -- old one finishes, the old run's writes silently no-op instead of clobbering
 -- the new run's progress. See db.set_status's docstring.
 ALTER TABLE ms_videos ADD COLUMN IF NOT EXISTS generation INT NOT NULL DEFAULT 0;
+
+-- Cross-environment collision fix: local dev and the Fly.io deployment share
+-- this SAME Postgres manifest (and the same Prefect Cloud workspace) but have
+-- INCOMPATIBLE storage backends (local disk vs. Tigris/S3). Namespacing
+-- Prefect deployment names by environment (src/config.py's DEPLOYMENT_ENV)
+-- only fixes which environment's WORKERS execute a scheduled run — it does
+-- nothing to stop the WRONG environment's dispatcher from CLAIMING a pending
+-- row in the first place, since claim_pending()'s admission query has no
+-- notion of "where do this row's bytes actually live." Found live: a
+-- Fly-claimed row for a locally-uploaded document, scheduled onto Fly's own
+-- deployment, executed by a Fly worker whose Tigris bucket never had the
+-- bytes — genuine botocore NoSuchKey, not a resilience bug.
+-- NULL = unconstrained (URI-registered sources fetch fresh over HTTPS at
+-- ingest time and never touch our own storage, so ANY environment's worker
+-- can run them safely — narrowing them to one environment would only cost
+-- capacity for no correctness benefit). Set only for bytes-in-hand uploads
+-- (storage_key rows), to the uploading process's own DEPLOYMENT_ENV.
+ALTER TABLE ms_videos ADD COLUMN IF NOT EXISTS storage_env TEXT;
 """
 
 # Advisory-lock key for schema init. Arbitrary but stable — must not collide
@@ -197,20 +215,26 @@ def upsert_pending(video: dict[str, Any]) -> dict:
     stale run from overwriting a newer run's 'indexed' with its own (possibly
     'failed') outcome. `kind` defaults to 'video' so every existing caller
     (src/api/videos.py) works unchanged; documents pass kind + uri."""
-    video = {"kind": "video", "uri": None, "inflight": list(INFLIGHT_STATUSES), **video}
+    video = {"kind": "video", "uri": None, "storage_env": None,
+             "inflight": list(INFLIGHT_STATUSES), **video}
     with pool().connection() as conn:
         row = conn.execute(
             """
             INSERT INTO ms_videos (id, user_id, source, url, storage_key, source_hash,
-                                   title, kind, uri, status)
+                                   title, kind, uri, storage_env, status)
             VALUES (%(id)s, %(user_id)s, %(source)s, %(url)s, %(storage_key)s,
-                    %(source_hash)s, %(title)s, %(kind)s, %(uri)s, 'pending')
+                    %(source_hash)s, %(title)s, %(kind)s, %(uri)s, %(storage_env)s, 'pending')
             ON CONFLICT (id) DO UPDATE SET
                 url = COALESCE(EXCLUDED.url, ms_videos.url),
                 storage_key = COALESCE(EXCLUDED.storage_key, ms_videos.storage_key),
                 source_hash = COALESCE(EXCLUDED.source_hash, ms_videos.source_hash),
                 title = COALESCE(EXCLUDED.title, ms_videos.title),
                 uri = COALESCE(EXCLUDED.uri, ms_videos.uri),
+                -- fresh bytes are (re-)written to THIS process's own storage
+                -- immediately before every upload-path call into this
+                -- function (see documents.py/videos.py), so the newest
+                -- registration's environment always wins, same as kind.
+                storage_env = COALESCE(EXCLUDED.storage_env, ms_videos.storage_env),
                 kind = EXCLUDED.kind,
                 status = CASE WHEN ms_videos.status = ANY(%(inflight)s)
                               THEN ms_videos.status ELSE 'pending' END,
@@ -454,23 +478,28 @@ def wfq_claim(limit: int, *, fair: bool = True) -> list[dict]:
             SELECT id, row_number() OVER (
                 PARTITION BY user_id ORDER BY created_at, id) AS rn
             FROM ms_videos WHERE status = 'pending'
+              AND (storage_env IS NULL OR storage_env = %(env)s)
         ) t
         ORDER BY rn, id
-        LIMIT %s
+        LIMIT %(limit)s
         """
         if fair else
         """
         SELECT id FROM ms_videos WHERE status = 'pending'
+          AND (storage_env IS NULL OR storage_env = %(env)s)
         ORDER BY created_at, id
-        LIMIT %s
+        LIMIT %(limit)s
         """
     )
     with pool().connection() as conn:
-        return _claim_with_conn(conn, limit, order_sql)
+        return _claim_with_conn(conn, limit, order_sql, env=DEPLOYMENT_ENV)
 
 
-def _claim_with_conn(conn, limit: int, order_sql: str) -> list[dict]:
-    picked = conn.execute(order_sql, (limit,)).fetchall()
+def _claim_with_conn(conn, limit: int, order_sql: str, *, env: str) -> list[dict]:
+    # storage_env IS NULL always matches — see the column's comment in SCHEMA:
+    # URI-registered sources never touch our own storage, so any environment's
+    # worker can run them; only bytes-in-hand uploads are environment-pinned.
+    picked = conn.execute(order_sql, {"env": env, "limit": limit}).fetchall()
     ids = [r["id"] for r in picked]
     if not ids:
         return []
@@ -491,7 +520,7 @@ def _claim_with_conn(conn, limit: int, order_sql: str) -> list[dict]:
 _DISPATCH_ADVISORY_LOCK_KEY = 0x4D53_5746_51  # "MSWFQ" in hex, arbitrary
 
 
-def claim_pending(cap: int, *, fair: bool = True) -> list[dict]:
+def claim_pending(cap: int, *, fair: bool = True, env: str | None = None) -> list[dict]:
     """Atomically compute free capacity AND claim pending sources as ONE
     locked operation, across every dispatcher process (one per worker
     replica) — this is what src/dispatcher.py calls, not wfq_claim directly.
@@ -519,21 +548,24 @@ def claim_pending(cap: int, *, fair: bool = True) -> list[dict]:
     function returns, outside the lock)."""
     if cap <= 0:
         return []
+    env = env if env is not None else DEPLOYMENT_ENV
     order_sql = (
         """
         SELECT id FROM (
             SELECT id, row_number() OVER (
                 PARTITION BY user_id ORDER BY created_at, id) AS rn
             FROM ms_videos WHERE status = 'pending'
+              AND (storage_env IS NULL OR storage_env = %(env)s)
         ) t
         ORDER BY rn, id
-        LIMIT %s
+        LIMIT %(limit)s
         """
         if fair else
         """
         SELECT id FROM ms_videos WHERE status = 'pending'
+          AND (storage_env IS NULL OR storage_env = %(env)s)
         ORDER BY created_at, id
-        LIMIT %s
+        LIMIT %(limit)s
         """
     )
     with pool().connection() as conn:
@@ -545,7 +577,7 @@ def claim_pending(cap: int, *, fair: bool = True) -> list[dict]:
         slots = cap - inflight
         if slots <= 0:
             return []
-        return _claim_with_conn(conn, slots, order_sql)
+        return _claim_with_conn(conn, slots, order_sql, env=env)
 
 
 # ── Crash safety / reconciler (Block G) ──────────────────────────────────────

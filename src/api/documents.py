@@ -108,7 +108,15 @@ def _register(uid: str, kind: str, title: str | None, *,
     an external https:// document (src/ingest/document.py fetches it, SSRF-
     hardened, at ingest time), `storage_key` for an upload already sitting in
     OUR storage (read directly via storage.get_bytes() — no fetch, no expiry,
-    no public exposure)."""
+    no public exposure).
+
+    storage_key rows are tagged with THIS process's config.DEPLOYMENT_ENV —
+    local dev and the Fly.io deployment share one Postgres manifest and one
+    Prefect Cloud workspace but have incompatible storage backends, so a
+    dispatcher running in a different environment must never claim a row
+    whose bytes only exist in this one (db.claim_pending filters on it).
+    uri rows stay untagged (None): they fetch fresh over HTTPS at ingest
+    time and never touch our own storage, so any environment can run them."""
     if kind not in _KINDS:
         raise HTTPException(400, f"kind must be one of {_KINDS}.")
     if uri is not None:
@@ -123,6 +131,7 @@ def _register(uid: str, kind: str, title: str | None, *,
         "id": doc_id, "user_id": uid, "source": "document",
         "url": None, "storage_key": storage_key, "source_hash": source_hash or uri,
         "title": title, "kind": kind, "uri": uri,
+        "storage_env": config.DEPLOYMENT_ENV if storage_key else None,
     })
     return {"id": row["id"], "status": row["status"], "kind": row["kind"]}
 

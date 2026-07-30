@@ -300,7 +300,9 @@ class ClaimPendingTests(unittest.TestCase):
         with patch.object(db, "pool", return_value=_FakePool(conn)):
             db.claim_pending(8, fair=True)  # cap=8, inflight=5 -> exactly 3 slots
         select_call = next(c for c in conn.calls if _call_kind(c[0]) == "select_pending")
-        self.assertEqual(select_call[1], (3,))
+        # named params now (storage_env filter needs its own placeholder
+        # alongside LIMIT) — see db.claim_pending's env-aware admission query.
+        self.assertEqual(select_call[1]["limit"], 3)
 
     def test_returns_empty_and_never_attempts_a_claim_when_no_slots_remain(self):
         conn = _FakeConnection(inflight_count=8, pending_ids=[], claimed_rows=[])

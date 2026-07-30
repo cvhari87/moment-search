@@ -12,8 +12,13 @@ from __future__ import annotations
 
 from prefect.deployments import run_deployment
 
-INGEST_DEPLOYMENT = "ms-ingest-video/ingest"
-INGEST_DOCUMENT_DEPLOYMENT = "ms-ingest-document/ingest"
+from . import config
+
+# Suffixed by DEPLOYMENT_ENV (see src/config.py) so local dev and the Fly.io
+# deployment — sharing one Prefect Cloud workspace but incompatible storage
+# backends — never schedule a run onto the other environment's workers.
+INGEST_DEPLOYMENT = f"ms-ingest-video/ingest-{config.DEPLOYMENT_ENV}"
+INGEST_DOCUMENT_DEPLOYMENT = f"ms-ingest-document/ingest-{config.DEPLOYMENT_ENV}"
 
 
 def enqueue_video(video_id: str, user_id: str, generation: int) -> str:

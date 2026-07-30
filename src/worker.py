@@ -49,8 +49,8 @@ def main():
     # WORKER_CONCURRENCY always had, just now spanning two flows.
     while True:
         try:
-            print(f"[worker] serving 'ms-ingest-video/ingest' + "
-                  f"'ms-ingest-document/ingest' (concurrency {limit})")
+            print(f"[worker] serving 'ms-ingest-video/ingest-{config.DEPLOYMENT_ENV}' + "
+                  f"'ms-ingest-document/ingest-{config.DEPLOYMENT_ENV}' (concurrency {limit})")
             # entrypoint_type=MODULE_PATH is load-bearing, not cosmetic: Prefect's
             # default (FILE_PATH, e.g. "src/ingest/pipeline.py:ingest_video")
             # unconditionally loads the flow run's subprocess via
@@ -66,8 +66,10 @@ def main():
             # single flow.serve() call never hit it because it manages its own
             # entrypoint resolution differently.
             serve(
-                ingest_video.to_deployment(name="ingest", entrypoint_type=EntrypointType.MODULE_PATH),
-                ingest_document.to_deployment(name="ingest", entrypoint_type=EntrypointType.MODULE_PATH),
+                ingest_video.to_deployment(
+                    name=f"ingest-{config.DEPLOYMENT_ENV}", entrypoint_type=EntrypointType.MODULE_PATH),
+                ingest_document.to_deployment(
+                    name=f"ingest-{config.DEPLOYMENT_ENV}", entrypoint_type=EntrypointType.MODULE_PATH),
                 limit=limit,
                 # Block I: measured live via Prefect Cloud's own flow-run
                 # timestamps that Prefect's runner (this serve() call) only
