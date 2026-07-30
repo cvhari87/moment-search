@@ -4,6 +4,39 @@
 
 🌐 **Live app:** [momentsearch.fly.dev](https://momentsearch.fly.dev/get-started) · 🎥 **Demo video:** [watch on Loom](https://www.loom.com/share/d9d10e4ca7c5448eb9ab2a7b6db619f4) — a live walkthrough asking one question across a video, a research paper, and a slide deck, and getting back a single grounded answer with correctly-typed citations (timestamp / page / slide) that deep-link straight to the original source.
 
+I lead this end to end — system architecture, distributed infra, the ML retrieval
+pipeline, and production reliability — the way I expect any engineering leader to:
+hands-on with the code and the incidents, not just the roadmap. It's not a notebook
+demo: it's a multi-tenant system with a real work queue, measured SLAs, and
+crash-recovery guarantees I verified myself by killing a worker mid-job and proving
+nothing was lost.
+
+## At a glance
+
+- **Held to production SLAs, not just demoed.** An automated benchmark suite gates
+  every change against real targets: 0.929 recall@10, 0.788 MRR@6, 0.0% error rate, and
+  **zero data loss under a live worker crash** — verified by killing a worker mid-ingest
+  and confirming checkpoint-resume from the logs. Full evidence in
+  [`PRODUCT_EVAL.md`](PRODUCT_EVAL.md).
+- **Found, root-caused, and fixed a real distributed-systems bug under load** — a
+  cross-environment queue collision that caused silent job failures in production —
+  traced from an actual crash traceback, fixed, and re-verified. Written up in full,
+  including a plain-English explanation for a non-technical reader, in
+  [`LEARNINGS.md`](LEARNINGS.md).
+- **Scaled on the axis that actually matters.** Ingest (cheap, CPU, horizontal) and
+  embedding (expensive, GPU-ready, vertical) are deliberately split into independently
+  scalable services, so a backfill of cheap workers never has to wait on GPU capacity
+  and vice versa.
+- **Multi-tenant from the data model up.** Every row, bucket key, and vector is
+  `user_id`-scoped and filtered; a fair-scheduling dispatcher (weighted round-robin)
+  keeps one heavy user from starving everyone else's queue.
+- **Full-stack ownership:** system design · distributed queue & fair scheduling ·
+  multi-tenant vector search (Qdrant) · multimodal RAG (CLIP + LLM) · Postgres data
+  modeling · object storage · CI/CD to Fly.io · cost-aware infra (stateless compute,
+  rented managed state).
+
+## What it does
+
 MomentSearch is an open-source, production-shaped stack for **visual** video
 search and RAG. Users upload videos (or paste YouTube URLs); background workers
 sample keyframes, dedup them, embed them with CLIP and index them per-user in
