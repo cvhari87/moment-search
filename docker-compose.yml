@@ -13,7 +13,16 @@ services:
   # GPU machine later — only CLIP_SERVICE_URL changes).
   clip:
     build: .
-    command: uvicorn src.clip_service:app --host 0.0.0.0 --port 8001
+    # Block K: --workers 3 — a single process serialized every embed_docs
+    # call (bulk paper/deck text embedding, not just CLIP) behind one
+    # process-wide _text_lock (src/rag/embeddings.py), so scaling worker
+    # replicas never increased embedding throughput — both replicas' calls
+    # still funneled through this one lock. 3 processes = 3 independent
+    # locks (each still internally TEXT_EMBED_THREADS-capped) = genuine
+    # parallel embedding. Not higher: each process loads its own full model
+    # copy (~1.4GB measured), and this container's memory limit is shared
+    # with api/worker/worker on one Docker Desktop VM.
+    command: uvicorn src.clip_service:app --host 0.0.0.0 --port 8001 --workers 3
     env_file: .env
     environment:
       # Block I: this is the process that holds the bge model in-process

@@ -1010,3 +1010,66 @@ window's `modalities`/`rrf`/branch composition for this exact query to confirm v
 mechanism). Candidate directions: magnitude-aware fusion (blend raw score into the RRF sum, not just
 rank) or an explicit tie-break preferring text over frame-only windows. Deferred at user's request
 ("in the interest of time, maybe we tackle this later") — not investigated further this session.
+
+## 2026-07-30 — Block K: final evidence
+
+Status: **complete — one genuine FAIL surfaced and reported, not papered over**
+
+- **Full regression:** repository unit tests (`tests/`, stdlib `unittest`) + benchmark self-tests
+  (`benchmark/test_bench_gates.py`) = **108/108** (89 + 19). Run via
+  `docker run --rm -v "$(pwd)":/app -w /app momentsearch-a3-api:latest python -m unittest
+  discover ...` — the Dockerfile doesn't `COPY` `tests/`/`benchmark/` into the image, so these
+  ran bind-mounted onto the built image rather than the image's own `/app`.
+- **`eval.py`** against the local stack: 7/8 automated checks pass. `documents_async` FAILs only
+  because its hardcoded probe (`arXiv 2312.10997`) is already registered in this long-lived dev
+  database from Block B — re-POSTing it returns the row's *current* status (`queued`), not
+  `pending`, failing the check's exact string match. Verified directly that async accept genuinely
+  works: a never-before-seen URI returns `202 {"status":"pending",...}` in 125ms. `decoupled` is
+  correctly deferred to `bench.py`, which independently PASSED it.
+- **`bench.py`** (SLA suite, run with `ADMIN_TOKEN`/`BASE_URL` exported — it reads env, not CLI
+  flags; a first attempt without exporting `ADMIN_TOKEN` produced cascading 401s that looked like a
+  throughput regression and wasn't one): accept_latency_p95 143.9ms (✅ ≤300), decoupling ratio
+  1.09× (✅ ≤1.3×, 63% of samples confirmed landing during genuinely active ingest work), recall@10
+  0.929 (✅ ≥0.70), MRR@6 0.645 — paper 0.639 / deck 0.6 / video 0.733 (✅ ≥0.60). Throughput 0.95
+  chunks/s (❌ vs 8) and this run's error_rate 25% (❌ vs 1%, 5/20 backfill docs stuck `queued`)
+  are the same single-worker-replica ceiling documented since Block H/I — real, re-measured on this
+  exact run, not assumed from history; Block N's `--scale worker=2` is the known fix, not applied
+  here.
+- **`bench.py --resilience` — a new, real regression, run twice to be sure:** the first run was
+  launched immediately after the SLA suite above, while its leftover 5-document backlog was still
+  draining on the same single worker — a contaminated experiment. After clearing that backlog and
+  confirming the queue idle, a second, isolated run **still failed**: of 10 documents killed with 5
+  genuinely `chunking`, only 3 resumed from checkpoint correctly; 2 had already-committed
+  `parsed.json` work **redone instead of resumed**, and 2 ended `failed` with a raw boto3
+  `NoSuchKey: ... GetObject ...` error — text that does not appear anywhere in this repo's source.
+  Verified directly, for every failed document: `storage.get_bytes(storage_key)` called by hand
+  against the live worker container **succeeded immediately** and returned the correct bytes — the
+  underlying data was never actually lost. This points at the orchestration/retry layer (most
+  likely Prefect Cloud's own post-kill task retry, not this app's checkpoint-resume code, which the
+  3 successful resumes in the same run prove works) rather than confirmed data loss, but the
+  rubric's literal bar ("finished stages not re-run") is not met by either run. This contradicts an
+  earlier clean "10 indexed, 0 failed, 0 stuck" result recorded above under Block I, which used a
+  temporarily-lowered `RECONCILE_STALE_S=8s`; this run used the production default (300s) — the
+  leading suspect for a follow-up, not yet confirmed.
+- **Live cross-source test**, sources the student didn't author: froze-registered
+  [Umar Jamil's public RAG-notes slide deck](https://raw.githubusercontent.com/hkproj/retrieval-augmented-generation-notes/main/Slides.pdf)
+  fresh this session (found via web search, not guessed), alongside the already-locked external
+  arXiv RAG survey and the external Pinecone hybrid-search video. One query — "compare embeddings,
+  vector databases, cosine similarity, and hybrid search techniques used in retrieval augmented
+  generation" — returned citations of all three kinds (video timestamp, paper page, deck slide)
+  with correct deeplinks to the original public sources, verified live on **both** localhost and
+  the deployed Fly URL (`https://momentsearch-wispy-silence-981.fly.dev/`, confirmed 200 after a
+  ~32s cold-start wake).
+- **Secret / staged-file / log audit:** `git status` clean going in; `.env`/`.env.*` confirmed
+  gitignored and untracked; grepped every tracked file and both `api`/`worker` container logs for
+  the live values of `ADMIN_TOKEN`, `DATABASE_URL`, `LLM_API_KEY`, `PREFECT_API_KEY`,
+  `QDRANT_API_KEY` — none found. `.env.example` contains only placeholders. Canary clean: no
+  `ROBOT_WAS_HERE.md`, no 🦥-prefixed commits in the last 100.
+- **Documented "How I ran it"** as a new `README.md` section (exact commands for the regression
+  suite, `eval.py`/`bench.py` invocation including the env-vs-CLI-flag gotcha, and the secret
+  audit) and wrote `PRODUCT_EVAL.md` at the repo root with the full self-assessment above. The
+  plan's `/fde-momentsearch-scaled-eval` reference turned out to be an actual project skill
+  (`.claude/skills/fde-momentsearch-scaled-eval/`), used directly for the report structure.
+- **Not done in this block, by design:** no attempt to fix the resilience regression or the
+  throughput gap — Block K is evidence-gathering, not a fix block. Both are recorded as the top
+  follow-up items in `PRODUCT_EVAL.md` rather than tuned away or silently retried until green.

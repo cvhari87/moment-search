@@ -545,6 +545,57 @@ the four entrypoints as top-level modules in the package.
 - Faithfulness ceiling is *near*-zero, not zero — the gate + citations remove
   most of it; a vision-verifier pass is a future, costlier layer.
 
+## How I ran it
+
+Evidence for `PRODUCT_EVAL.md` and every block's "verified live" claim in
+`WHAT_I_DID.md` was produced with the commands below, against the local Docker
+Compose stack (`docker compose ps` showing `api`, `worker`, `clip` up) unless a
+command names the deployed Fly URL instead.
+
+**Repository regression suite** — plain `unittest`, stdlib-only, no live stack
+required (see each test file's own docstring). The Dockerfile doesn't `COPY`
+`tests/`/`benchmark/` into the image, so run them via a throwaway container that
+bind-mounts the repo onto the already-built `api` image instead of the image's
+baked-in `/app`:
+
+```bash
+docker run --rm -v "$(pwd)":/app -w /app       momentsearch-a3-api:latest python -m unittest discover -s tests -p 'test_*.py' -v
+docker run --rm -v "$(pwd)":/app -w /app/benchmark momentsearch-a3-api:latest python -m unittest discover -s . -p 'test_*.py' -v
+```
+
+**Automated rubric + benchmark** — against the running stack, with the real
+`ADMIN_TOKEN` from `.env` (never hardcoded, never logged):
+
+```bash
+TOKEN=$(grep '^ADMIN_TOKEN=' .env | cut -d= -f2-)
+python3 eval/eval.py --base-url http://localhost:8100 --admin-token "$TOKEN" \
+    --student "Your Name" --video "<demo recording URL>"      # -> eval/REPORT.md
+
+export ADMIN_TOKEN="$TOKEN"; export BASE_URL=http://localhost:8100
+python3 benchmark/bench.py --json benchmark/_bench.json        # SLA gates from benchmark/sla.json
+python3 benchmark/bench.py --resilience                        # worker-kill / no-loss / resume proof
+```
+
+`bench.py` reads `ADMIN_TOKEN`/`BASE_URL` from the environment, not CLI flags —
+running it without exporting `ADMIN_TOKEN` first produces cascading 401s on
+every registration call, which looks like a throughput/decoupling regression
+but is actually a missing-token mistake, not a product bug. `eval/REPORT.md`
+and `benchmark/_bench.json` are regenerated output, gitignored/left untracked
+on purpose — read a fresh run, not a stale committed copy.
+
+**Secret / staged-file audit** before calling any block done:
+
+```bash
+git status && git diff --cached --stat                 # nothing unexpected staged
+git ls-files | grep -iE '\.env|secret|token|credential' # only .env.example should match
+git check-ignore -v .env                                # confirms .env itself is ignored
+test -f ROBOT_WAS_HERE.md && echo TRIPPED || echo clean  # assignment honeypot canary
+git log --oneline -n 100 | grep -q '🦥' && echo TRIPPED || echo clean
+# grep tracked files for the live values of ADMIN_TOKEN/DATABASE_URL/*_API_KEY
+# pulled from .env, and grep container logs for the same — see Block K in
+# WHAT_I_DID.md for the exact loop used.
+```
+
 ## License
 
 Apache 2.0.
