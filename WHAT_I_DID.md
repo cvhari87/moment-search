@@ -1073,3 +1073,51 @@ Status: **complete — one genuine FAIL surfaced and reported, not papered over*
 - **Not done in this block, by design:** no attempt to fix the resilience regression or the
   throughput gap — Block K is evidence-gathering, not a fix block. Both are recorded as the top
   follow-up items in `PRODUCT_EVAL.md` rather than tuned away or silently retried until green.
+
+## 2026-07-30 — cross-environment dispatcher collision (real bug, fixed; distinct from the resilience regression)
+
+Status: **fixed and deployed — but confirmed NOT the same bug as Block K's `--resilience` FAIL**
+
+- **Trigger:** external review (a second reader's analysis of `PRODUCT_EVAL.md`) proposed that
+  Block K's `NoSuchKey` failures were an environment-affinity bug: local dev and the Fly deployment
+  share one Prefect Cloud workspace and one Neon manifest, but have incompatible storage backends
+  (`local` disk vs. Tigris/S3). Confirmed live: `flow.serve()`'s runner has no concept of
+  "environment," so either environment's worker can win the claim for any pending row, including
+  one whose bytes only exist on the other machine's disk.
+- **Root cause, two layers deep.** The first fix (suffix every deployment name with
+  `FLY_APP_NAME`, defaulting to `"local"`) closed HALF the problem: it stopped a NEW registration
+  from being scheduled under a name the wrong environment's worker was polling. It did not stop the
+  dispatcher's own claim query from admitting an old row for execution — proven by a second
+  `bench.py` run that still produced `NoSuchKey`, traced to flow runs scheduled under the
+  now-orphaned unsuffixed `ingest` deployment name. The full fix (user-approved, "full fix now"
+  over a narrower patch): a `storage_env` column on `ms_videos`, stamped with `DEPLOYMENT_ENV` at
+  registration time for any row backed by this app's own storage (`storage_key` set), left `NULL`
+  for anything fetched fresh over HTTPS at ingest time (YouTube URLs, external paper/deck URIs) —
+  those have no environment affinity at all. `db.claim_pending`'s admission query now filters
+  `storage_env IS NULL OR storage_env = %(env)s`, so a dispatcher can never admit a row whose bytes
+  it can't reach, in either direction.
+- **A second, unrelated bug surfaced during the Fly rollout:** after deploying the fix, Fly's
+  worker silently crash-looped (`except Exception: print + sleep 15s + retry`, invisible in
+  `fly logs` due to Python's default block-buffered stdout with no `PYTHONUNBUFFERED` set) on a
+  `403 Forbidden: "You have reached the maximum number of deployments for your workspace...
+  Current limit: 5"` — a previously-undocumented Prefect Cloud free-tier cap. The two now-orphaned
+  unsuffixed `ingest` deployments (one per flow) were still registered and eating two of the five
+  slots. Deleted them via `client.delete_deployment()`; Fly's worker recovered on its next retry
+  cycle.
+- **Verified:** re-ran `bench.py` after both fixes — zero `NoSuchKey` in `docker compose logs
+  worker` across the run. Fly's worker log confirmed it registered under the new
+  `ingest-momentsearch-wispy-silence-981` deployment name and is polling for scheduled runs.
+- **Explicitly NOT what this fixes — checked carefully before claiming otherwise:** re-reading
+  Block K's own `--resilience` writeup (`PRODUCT_EVAL.md` §1) shows its isolated run used
+  `STORAGE_PROVIDER=local` for every container involved — a single-environment SIGKILL-and-restart
+  experiment, with no Fly worker and no cross-environment claim possible. That run's two `NoSuchKey`
+  failures and two redone-instead-of-resumed stages are therefore a DIFFERENT bug from the one just
+  fixed here, despite an identical-looking error string. The eval's own leading suspect (a race
+  between this app's staleness reconciler and Prefect Cloud's native post-kill task retry, gated by
+  `RECONCILE_STALE_S`) remains open and is still the top item in `PRODUCT_EVAL.md`'s "Top fixes"
+  list. Caught this by checking the actual `STORAGE_PROVIDER` value of the failing run before
+  reporting the collision fix as a resilience fix — worth flagging because the first read of the
+  eval table treated "same error text" as "same bug," which would have been wrong.
+- **Not done:** did not re-run `bench.py --resilience` specifically after this fix (only the
+  general SLA suite, which doesn't run the SIGKILL experiment) — that gate's actual pass/fail state
+  post-fix is still unconfirmed, and the reconciler/Prefect-retry race behind it is untouched.

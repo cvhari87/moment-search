@@ -1412,6 +1412,66 @@ not both — CLIP's visual similarity on this corpus doesn't discriminate by rel
 signal. When adding a confidence check to a multi-signal fusion step, check whether each signal is
 actually discriminative on your data before assuming symmetric treatment is correct.
 
+## A shared queue across environments needs environment affinity, not just a shared schema
+
+Local dev and the Fly deployment were designed to share state on purpose — one Neon manifest, one
+Prefect Cloud workspace — so that registering a source in either place and searching from either
+place works against the same index. That design goal quietly implied a second one that was never
+stated: a dispatcher in either environment must never be ALLOWED to claim a row whose bytes it
+can't reach. Nothing enforced that. `flow.serve()`'s runner has no concept of "which environment am
+I," so the Fly worker and the local worker were both eligible to win the claim for literally any
+pending row, including one uploaded to local disk that Fly's Tigris-backed storage provider could
+never see. The failure mode (`NoSuchKey` from a process whose OWN `STORAGE_PROVIDER` was `local`)
+pointed at `storage.py`'s S3 branch, which made it look like a storage-layer bug; the actual defect
+was upstream, in the admission layer that let the wrong environment's worker pick up the row at
+all.
+
+The fix had to close TWO separate admission points, not one — a lesson from finding the first patch
+insufficient, not from planning it correctly the first time. Suffixing deployment names with
+`FLY_APP_NAME` (`ingest-local` vs. `ingest-<fly-app>`) stopped a NEWLY dispatched run from being
+picked up cross-environment, but did nothing about the dispatcher's own claim query, which was still
+happily admitting old rows under the orphaned unsuffixed name for whichever environment's worker
+polled first. Only adding a `storage_env` column — checked at the SAME point every other admission
+invariant is checked, `db.claim_pending`'s query — closed the actual race, because claiming and
+scheduling are two different moments a wrong-environment assignment can happen at, and a fix aimed
+at only one of them leaves the other exploitable. The general shape: when two independently-scaling
+deployments share one coordination layer (a queue, a manifest, a workspace) but do NOT share every
+resource behind it, every place that layer hands out work — not just the most visible one — needs
+to know which resources the recipient can actually reach.
+
+A second-order finding from the same rollout: fixing the collision meant naming deployments
+per-environment, which silently orphaned the old shared-name deployments — invisible until Prefect
+Cloud's free-tier hard cap (5 deployments per workspace, previously undocumented anywhere in this
+project) rejected the new registration with a `403` that a bare `except Exception: sleep 15;
+retry` loop swallowed into infinite, silent retries. Combined with Python's default block-buffered
+stdout (no `PYTHONUNBUFFERED` in the Dockerfile) making `fly logs` look empty rather than erroring,
+the worker looked "up but doing nothing" for longer than it should have. A fix that changes how many
+distinct named resources a system registers is worth checking against any hard cap the platform
+places on that resource count — the cap doesn't announce itself until you cross it, and by then the
+failure mode it produces may not resemble the cap at all.
+
+## The same error string from two different runs is not evidence of the same bug
+
+A collision-mechanism fix (above) and Block K's own recorded `--resilience` FAIL both produced the
+identical error text: a raw boto3 `NoSuchKey ... GetObject ...` traceback that appears nowhere in
+this repo's source. It would have been easy — and wrong — to report the collision fix as having
+resolved the resilience regression, since the symptom matched exactly. Checking one field before
+making that claim closed the question: Block K's isolated `--resilience` run had
+`STORAGE_PROVIDER=local` for EVERY container involved, including the one that failed. There was no
+second environment in that experiment at all, so the cross-environment claim race the fix targets
+could not have been the mechanism — the failure has to come from something else (the eval's own
+leading suspect: a race between the app's staleness reconciler and Prefect Cloud's own post-kill
+task retry, gated by `RECONCILE_STALE_S`).
+
+The generalizable check: an error string names WHERE something went wrong (here, an S3 GetObject
+call), not WHY the code reached that state. Two runs producing the same exception type from the
+same library call are only evidence of the same root cause if the PRECONDITIONS that could produce
+that exception are actually the same between them — here, "is more than one environment's worker in
+play at all" is exactly the precondition that differed, and checking it directly (one grep for the
+run's `STORAGE_PROVIDER` value) was cheaper and more conclusive than reasoning from the matching
+traceback. Claiming a fix resolved a regression it merely resembles is a worse outcome than not
+fixing the regression yet, because it closes the investigation on a still-open bug.
+
 ## An eval metric can be blind to exactly the regression it should catch
 
 `benchmark/bench.py`'s `measure_recall()` (recall@10: is the gold citation present ANYWHERE in the
