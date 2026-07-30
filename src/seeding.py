@@ -78,12 +78,19 @@ def seed_to_completion() -> bool:
         for v in todo:
             vid = sample_video_id(v["url"])
             print(f"[seed] -> {vid}: {v['title']}", flush=True)
-            db.upsert_pending({"id": vid, "user_id": config.DEFAULT_USER_ID,
-                               "source": "youtube", "url": v["url"],
-                               "storage_key": None, "source_hash": vid,
-                               "title": v["title"]})
+            row = db.upsert_pending({"id": vid, "user_id": config.DEFAULT_USER_ID,
+                                     "source": "youtube", "url": v["url"],
+                                     "storage_key": None, "source_hash": vid,
+                                     "title": v["title"]})
             try:
-                ingest_video(video_id=vid, user_id=config.DEFAULT_USER_ID)
+                # Seeding calls the flow in-process, bypassing the dispatcher
+                # (this runs as a one-shot gate before worker.py's reconciler/
+                # dispatcher even start) — so there's no wfq_claim() to mint a
+                # fresh lease. Use whatever generation the row already carries
+                # (0 unless something else has claimed it) so set_status's
+                # guard still matches instead of silently no-oping every write.
+                ingest_video(video_id=vid, user_id=config.DEFAULT_USER_ID,
+                            generation=row["generation"])
             except Exception as exc:
                 print(f"[seed] {vid} failed ({type(exc).__name__}: {exc})", flush=True)
 

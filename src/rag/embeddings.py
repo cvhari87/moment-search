@@ -30,7 +30,17 @@ import numpy as np
 
 from .. import config
 
-_lock = threading.Lock()
+# Two separate locks, not one shared lock: CLIP (torch/sentence-transformers)
+# and BGE (fastembed/ONNX) are different models with different thread-safety
+# properties, and a single warm clip_service.py process serves both branches
+# to every caller (api search queries AND worker ingest, via CLIP_SERVICE_URL
+# — see clip_service.py). A shared lock meant ingest's bulk document embeds
+# and search's own query embed serialized behind EACH OTHER even though
+# they don't touch the same model, which was a real, measured contributor to
+# the decoupling-ratio SLA gate (Block I) — a bigger effect than the
+# per-process CPU-thread question the two locks don't otherwise address.
+_clip_lock = threading.Lock()
+_text_lock = threading.Lock()
 
 
 # ── Local inference (used in-process, and by clip_service.py) ────────────────
@@ -62,7 +72,7 @@ def embed_jpegs_local(jpegs: list[bytes]) -> np.ndarray:
         return np.zeros((0, embedding_dim()), dtype=np.float32)
     images = [Image.open(io.BytesIO(b)).convert("RGB") for b in jpegs]
     try:
-        with _lock:  # sentence-transformers models are not thread-safe
+        with _clip_lock:  # sentence-transformers models are not thread-safe
             vecs = _model().encode(images, convert_to_numpy=True, batch_size=32,
                                    show_progress_bar=False)
     finally:
@@ -73,7 +83,7 @@ def embed_jpegs_local(jpegs: list[bytes]) -> np.ndarray:
 
 def embed_text_local(text: str) -> np.ndarray:
     """Encode a text query into the shared CLIP space (local model)."""
-    with _lock:
+    with _clip_lock:
         vec = _model().encode([text], convert_to_numpy=True, show_progress_bar=False)
     return _normalize(np.asarray(vec, dtype=np.float32))[0]
 
@@ -87,21 +97,32 @@ def embed_text_local(text: str) -> np.ndarray:
 def _text_model():
     from fastembed import TextEmbedding
 
-    return TextEmbedding(config.TEXT_EMBED_MODEL)
+    return TextEmbedding(config.TEXT_EMBED_MODEL, threads=config.TEXT_EMBED_THREADS or None)
 
 
 def embed_docs_local(texts: list[str]) -> np.ndarray:
-    """Embed transcript chunks (documents) — bge, L2-normalized already."""
+    """Embed transcript chunks (documents) — bge, L2-normalized already.
+
+    Sub-batched at TEXT_EMBED_BATCH, acquiring/releasing _text_lock once per
+    sub-batch rather than once for the whole call: a large document can mean
+    hundreds of texts in one call, and holding the lock for all of them at
+    once would block a concurrent embed_query_local call (same lock, same
+    process — see clip_service.py) for that entire duration. Releasing
+    between sub-batches lets a waiting query embed interleave instead of
+    queuing behind the whole document."""
     if not texts:
         return np.zeros((0, config.TEXT_EMBED_DIM), dtype=np.float32)
-    with _lock:
-        vecs = list(_text_model().embed(texts))
-    return np.asarray(vecs, dtype=np.float32)
+    out: list[np.ndarray] = []
+    for i in range(0, len(texts), config.TEXT_EMBED_BATCH):
+        batch = texts[i:i + config.TEXT_EMBED_BATCH]
+        with _text_lock:
+            out.extend(_text_model().embed(batch))
+    return np.asarray(out, dtype=np.float32)
 
 
 def embed_query_local(text: str) -> np.ndarray:
     """Embed a search query for the transcript branch (bge query prompt)."""
-    with _lock:
+    with _text_lock:
         vec = next(iter(_text_model().query_embed([text])))
     return np.asarray(vec, dtype=np.float32)
 
@@ -186,11 +207,23 @@ def embed_docs(texts: list[str]) -> np.ndarray:
 
 
 def embed_query(text: str) -> np.ndarray:
-    """Search query -> text vector for the transcript branch (same provider
-    dispatch as embed_docs)."""
+    """Search query -> text vector for the transcript branch.
+
+    Deliberately ALWAYS local, unlike embed_docs (which routes bulk ingest
+    embedding to the shared clip service when CLIP_SERVICE_URL is set): a
+    search query is one small, latency-critical call, and routing it
+    through that SAME process — competing for its _text_lock against
+    ingest's bulk document embeds — was measured live (Block I) to
+    noticeably slow search during heavy concurrent ingest, even after
+    splitting the CLIP/BGE locks and sub-batching embed_docs_local. Splitting
+    the lock only bounds the wait to one sub-batch; it doesn't remove the
+    contention, and a document's chunk count is often smaller than
+    TEXT_EMBED_BATCH anyway (one sub-batch = the whole document, no
+    interleaving opportunity at all). Running the query embed in THIS
+    process instead means it never contends with ingest's lock in the first
+    place — different process, own model instance, own lock. The bge model
+    is lightweight (no torch, unlike CLIP), so duplicating it here is cheap;
+    see the API's own startup warmup in src/app.py."""
     if config.TEXT_EMBED_PROVIDER == "openai":
         return embed_openai([text])[0]
-    if config.CLIP_SERVICE_URL:
-        vec = _post("/embed/query", {"text": text}, timeout=60)["vector"]
-        return np.asarray(vec, dtype=np.float32)
     return embed_query_local(text)

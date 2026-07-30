@@ -18,6 +18,7 @@ upload, and prefix listing + batch delete (a video's frames go in one call).
 """
 from __future__ import annotations
 
+import os
 import shutil
 from datetime import timedelta
 from pathlib import Path
@@ -147,7 +148,14 @@ def put_bytes(key: str, body: bytes, content_type: str = "application/octet-stre
     if STORAGE_PROVIDER == "local":
         path = DATA / key
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(body)
+        # Atomic write: a process killed mid-write must never leave a
+        # truncated/corrupt file that exists() then reports as a complete,
+        # valid checkpoint (src/ingest/document.py's parse/chunk resume logic
+        # trusts exists() alone). Write to a sibling temp file — same
+        # filesystem, so os.replace() is an atomic rename, not a copy.
+        tmp = path.with_name(f".{path.name}.tmp{os.getpid()}")
+        tmp.write_bytes(body)
+        os.replace(tmp, path)
         return str(path)
     if STORAGE_PROVIDER == "gcp_native":
         _gcs_bucket().blob(key).upload_from_string(body, content_type=content_type)

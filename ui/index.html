@@ -3,37 +3,36 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>MomentSearch — search video by what's on screen</title>
+<title>MomentSearch — ask anything across video, docs & decks</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <script src="https://cdn.tailwindcss.com"></script>
 <script>
   tailwind.config = { theme: { extend: {
-    colors: { paper:"#FBF7F0", paper2:"#F3ECE0", card:"#FFFFFF", ink:"#1E1B16",
-              muted:"#6B6357", line:"#E7DECF", coral:"#FF5A3C", coral2:"#E8472B" },
+    colors: { paper:"#F4F6F9", paper2:"#E9EDF2", card:"#FFFFFF", ink:"#1E1B16",
+              muted:"#64707C", line:"#DFE4EA",
+              accent:"#3B4A6B", accent2:"#29354D", danger:"#B3261E" },
     fontFamily: { serif:['Fraunces','Georgia','serif'], sans:['Inter','system-ui','sans-serif'] },
   }}}
 </script>
 <style>
-  html,body{background:#FBF7F0;color:#1E1B16;font-family:Inter,system-ui,sans-serif}
+  html,body{background:#F4F6F9;color:#1E1B16;font-family:Inter,system-ui,sans-serif}
   .display{font-family:Fraunces,Georgia,serif}
   .prose-body{font-size:16px;line-height:1.75;color:#2a261f}
   .prose-body b,.prose-body strong{font-weight:700;color:#1E1B16}
   .prose-body ul{margin:8px 0}.prose-body li{position:relative;padding-left:18px;margin:5px 0}
-  .prose-body li:before{content:"";position:absolute;left:2px;top:10px;width:6px;height:6px;border-radius:50%;background:#FF5A3C}
+  .prose-body li:before{content:"";position:absolute;left:2px;top:10px;width:6px;height:6px;border-radius:50%;background:#3B4A6B}
   .cite{display:inline-flex;align-items:center;justify-content:center;min-width:20px;height:20px;padding:0 5px;margin:0 2px;
-    background:rgba(255,90,60,.14);color:#E8472B;border:1px solid rgba(255,90,60,.35);border-radius:6px;
+    background:rgba(59,74,107,.14);color:#29354D;border:1px solid rgba(59,74,107,.35);border-radius:6px;
     font-size:11px;font-weight:700;cursor:pointer;vertical-align:1px}
-  .cite:hover{background:#FF5A3C;color:#fff}
-  .chip{font-size:12.5px;padding:7px 13px;border:1px solid #E7DECF;border-radius:999px;background:#fff;color:#4f4738;cursor:pointer}
-  .chip:hover{border-color:#FF5A3C;color:#1E1B16}
-  .shimmer{background:linear-gradient(90deg,#F3ECE0 25%,#FBF7F0 37%,#F3ECE0 63%);background-size:400% 100%;animation:sh 1.3s infinite}
+  .cite:hover{background:#3B4A6B;color:#fff}
+  .chip{font-size:12.5px;padding:7px 13px;border:1px solid #DFE4EA;border-radius:999px;background:#fff;color:#47505A;cursor:pointer}
+  .chip:hover{border-color:#3B4A6B;color:#1E1B16}
+  .shimmer{background:linear-gradient(90deg,#E9EDF2 25%,#F4F6F9 37%,#E9EDF2 63%);background-size:400% 100%;animation:sh 1.3s infinite}
   @keyframes sh{0%{background-position:100% 0}100%{background-position:0 0}}
   .fade-in{animation:fi .45s ease both}@keyframes fi{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
-  .tab{padding:6px 14px;border-radius:999px;cursor:pointer;font-size:13px;border:1px solid #E7DECF;background:#fff;color:#6B6357}
-  .tab.active{border-color:#FF5A3C;color:#E8472B;background:rgba(255,90,60,.07)}
-  ::selection{background:rgba(255,90,60,.22)}
+  ::selection{background:rgba(59,74,107,.22)}
 </style>
 <!--MS_MODE-->
 </head>
@@ -42,20 +41,21 @@
 <!-- HEADER -->
 <header class="border-b border-line">
   <div class="max-w-6xl mx-auto px-6 py-4 flex items-center gap-3">
-    <div class="w-8 h-8 rounded-lg bg-coral flex items-center justify-center text-white font-bold display">M</div>
+    <div class="w-8 h-8 rounded-lg bg-accent flex items-center justify-center text-white font-bold display">M</div>
     <span class="font-bold tracking-tight">MomentSearch</span>
-    <span class="text-muted text-sm hidden sm:inline">· visual video search</span>
+    <span class="text-muted text-sm hidden sm:inline">· find any moment, anywhere</span>
     <span id="llmBadge" class="ml-auto text-xs px-3 py-1 rounded-full border border-line text-muted">checking…</span>
+    <a id="headerModeLink" href="/get-started" class="hidden text-xs font-semibold text-white bg-accent hover:bg-accent2 rounded-full px-4 py-1.5 transition"></a>
   </div>
 </header>
 
 <!-- HERO / ASK (Perplexity-style centered search) -->
 <section class="max-w-2xl mx-auto px-6 pt-20 pb-6 text-center">
-  <div id="heroBadge" class="inline-flex items-center gap-2 text-xs font-semibold text-coral2 bg-coral/10 border border-coral/25 rounded-full px-3 py-1 mb-6">
+  <div id="heroBadge" class="inline-flex items-center gap-2 text-xs font-semibold text-accent2 bg-accent/10 border border-accent/25 rounded-full px-3 py-1 mb-6">
     ● Sample project · four LLM talks, pre-indexed
   </div>
   <h1 id="heroTitle" class="display text-4xl sm:text-5xl font-bold leading-[1.05] tracking-tight">
-    A Deep Dive into <span class="text-coral">LLMs</span>.
+    A Deep Dive into <span class="text-accent">LLMs</span>.
   </h1>
   <p id="heroSub" class="mt-4 text-[17px] text-muted leading-relaxed mx-auto max-w-lg">
     Ask anything shown or said across these talks. MomentSearch searches both the
@@ -63,40 +63,52 @@
   </p>
 
   <!-- big centered search bar -->
-  <div class="mt-8 flex items-end gap-2 bg-white border border-line rounded-2xl shadow-sm px-3 py-2.5 text-left focus-within:border-coral focus-within:ring-4 focus-within:ring-coral/15 transition">
+  <div class="mt-8 flex items-end gap-2 bg-white border border-line rounded-2xl shadow-sm px-3 py-2.5 text-left focus-within:border-accent focus-within:ring-4 focus-within:ring-accent/15 transition">
     <textarea id="q" rows="1" placeholder="Ask about anything shown on screen…"
       class="flex-1 bg-transparent outline-none resize-none text-[16px] leading-relaxed px-2 py-2"></textarea>
     <button id="go" aria-label="Ask"
-      class="shrink-0 w-10 h-10 rounded-xl bg-coral hover:bg-coral2 text-white text-lg flex items-center justify-center transition">→</button>
+      class="shrink-0 w-10 h-10 rounded-xl bg-accent hover:bg-accent2 text-white text-lg flex items-center justify-center transition">→</button>
   </div>
   <div id="examples" class="mt-5 flex flex-wrap gap-2 justify-center"></div>
-  <a id="modeLink" href="/get-started" class="inline-block mt-6 text-sm font-semibold text-coral2 hover:text-coral"></a>
+  <a id="modeLink" href="/get-started" class="inline-block mt-6 text-sm font-semibold text-accent2 hover:text-accent"></a>
 </section>
 
 <main class="max-w-6xl mx-auto px-6 pb-16">
 
-  <!-- LIBRARY -->
+  <!-- LIBRARY (videos, papers, and decks together — one place to add, one place to browse) -->
   <section class="bg-card border border-line rounded-2xl p-5 mt-6">
     <div class="flex items-center justify-between flex-wrap gap-3 mb-4">
-      <h2 id="libTitle" class="display text-xl font-600">Your videos</h2>
-      <div id="addTabs" class="flex gap-2">
-        <span class="tab active" data-tab="yt">YouTube URL</span>
-        <span class="tab" data-tab="up">Upload</span>
-      </div>
+      <h2 id="libTitle" class="display text-xl font-600">Your library</h2>
     </div>
     <div id="addControls">
-      <div id="tab-yt" class="flex gap-2 flex-wrap">
-        <input id="ytUrl" type="text" placeholder="https://youtube.com/watch?v=…"
-          class="flex-1 min-w-[220px] bg-white border border-line rounded-xl px-4 py-2.5 text-sm outline-none focus:border-coral">
-        <button id="ytBtn" class="bg-ink hover:bg-black text-white text-sm font-semibold rounded-xl px-5">Ingest</button>
+      <div id="tokenRow" class="flex gap-2 flex-wrap mb-3">
+        <input id="adminToken" type="password" autocomplete="off" placeholder="Admin token (required to add or remove items)"
+          class="flex-1 min-w-[220px] bg-white border border-line rounded-xl px-4 py-2 text-xs outline-none focus:border-accent">
       </div>
-      <div id="tab-up" class="hidden flex gap-2 flex-wrap items-center">
-        <input id="upFile" type="file" accept="video/*" class="flex-1 min-w-[220px] text-sm">
-        <button id="upBtn" class="bg-ink hover:bg-black text-white text-sm font-semibold rounded-xl px-5 py-2.5">Upload &amp; ingest</button>
+      <div class="flex flex-col gap-2">
+        <div class="flex gap-2 flex-wrap items-center">
+          <input id="addUrl" type="text" placeholder="Paste a YouTube or document URL…"
+            class="flex-1 min-w-[220px] bg-white border border-line rounded-xl px-4 py-2.5 text-sm outline-none focus:border-accent">
+          <select id="urlKind" class="hidden bg-white border border-line rounded-xl px-3 py-2.5 text-sm outline-none focus:border-accent" title="Is the linked document a paper or a slide deck?">
+            <option value="paper">Paper</option>
+            <option value="deck">Deck</option>
+          </select>
+          <button id="addUrlBtn" class="bg-ink hover:bg-black text-white text-sm font-semibold rounded-xl px-5 py-2.5">Add</button>
+        </div>
+        <div class="flex gap-2 flex-wrap items-center">
+          <input id="addFile" type="file"
+            accept="video/*,application/pdf,.pdf,.pptx,application/vnd.openxmlformats-officedocument.presentationml.presentation"
+            class="flex-1 min-w-[220px] text-sm">
+          <select id="fileKind" class="hidden bg-white border border-line rounded-xl px-3 py-2.5 text-sm outline-none focus:border-accent" title="Is this PDF a paper or a slide deck?">
+            <option value="paper">Paper</option>
+            <option value="deck">Deck</option>
+          </select>
+          <button id="addFileBtn" class="bg-ink hover:bg-black text-white text-sm font-semibold rounded-xl px-5 py-2.5">Upload</button>
+        </div>
       </div>
       <div id="ingestStatus" class="text-sm text-muted mt-3 min-h-[20px]"></div>
     </div>
-    <div id="videos" class="flex flex-wrap gap-2 mt-2"></div>
+    <div id="library" class="flex flex-wrap gap-2 mt-2"></div>
     <div id="scopeLine" class="hidden text-xs text-muted mt-3"></div>
     <p id="libNote" class="text-xs text-muted mt-3">YouTube is searched by picture (frames) and transcript; uploads by picture only for now. First ingest downloads the models.</p>
   </section>
@@ -128,7 +140,7 @@
       <div class="text-xs text-muted">
         <div id="mFrameLabel" class="font-semibold text-ink mb-0.5">Matched frame</div>
         <span id="mFrameDesc">This is what CLIP matched your question against — the still it judged closest to what you asked.</span>
-        <a id="mOut" href="#" target="_blank" class="text-coral2 font-semibold hover:text-coral block mt-1">Open on source ↗</a>
+        <a id="mOut" href="#" target="_blank" class="text-accent2 font-semibold hover:text-accent block mt-1">Open on source ↗</a>
       </div>
     </div>
   </div>
@@ -150,19 +162,22 @@ const MODE = window.MS_MODE || "sample";   // "sample" (curated, read-only) | "f
 /* ---------- mode-specific framing ---------- */
 function applyMode(){
   if(MODE==="full"){
-    $("#heroBadge").innerHTML='● Bring your own videos';
-    $("#heroTitle").innerHTML='Ask your videos <span class="text-coral">anything</span> you can see.';
-    $("#heroSub").textContent='Add a YouTube URL or upload a file. MomentSearch finds the exact moments — and plays each one right beside the answer.';
+    $("#heroBadge").innerHTML='● Bring your own library';
+    $("#heroTitle").innerHTML='Ask anything, <span class="text-accent">across everything</span> you bring.';
+    $("#heroSub").textContent='Videos, papers, slide decks — MomentSearch finds the exact moment, page, or slide, and shows it right beside the answer.';
+    $("#q").placeholder='Ask anything — across your videos, docs & decks…';
     $("#modeLink").textContent='← Back to the sample';     $("#modeLink").href='/';
-    $("#libTitle").textContent='Your videos';
-    $("#libNote").innerHTML='YouTube videos are searched by <b>both</b> what\'s shown (frames) and what\'s said (transcript). Uploaded files are searched by picture only for now — no transcript yet. Tip: unselect the samples to search only your own uploads.';
+    $("#headerModeLink").classList.add("hidden");
+    $("#libTitle").textContent='Your library';
+    $("#libNote").innerHTML='YouTube videos are searched by <b>both</b> what\'s shown (frames) and what\'s said (transcript). Uploaded videos are searched by picture only for now — no transcript yet. Papers and slide decks are searched by their text. Tip: unselect the samples to search only your own library.';
   } else {
     $("#heroBadge").innerHTML='● Sample project · four LLM talks, pre-indexed';
-    $("#heroTitle").innerHTML='A Deep Dive into <span class="text-coral">LLMs</span>.';
+    $("#heroTitle").innerHTML='A Deep Dive into <span class="text-accent">LLMs</span>.';
     $("#heroSub").textContent='Ask anything about these four talks — MomentSearch finds the exact moment from what\'s shown on screen and what\'s said, and plays it right here.';
-    $("#modeLink").textContent='Want your own videos? Get started →';   $("#modeLink").href='/get-started';
+    $("#q").placeholder='Ask about anything shown on screen…';
+    $("#modeLink").textContent='Want to search your own library? Get started →';   $("#modeLink").href='/get-started';
+    $("#headerModeLink").textContent='Get started →';   $("#headerModeLink").classList.remove("hidden");
     $("#libTitle").textContent='In this deep dive';
-    $("#addTabs").classList.add("hidden");
     $("#addControls").classList.add("hidden");
     $("#libNote").textContent='A curated set of LLM explainers and talks, indexed by what appears on screen.';
   }
@@ -183,91 +198,139 @@ function renderMarkdown(md){
   closeUl(); return html;
 }
 
-/* ---------- config + library ---------- */
+/* ---------- admin token (mutating endpoints are Bearer-gated; the UI never
+   sent one, so every add/retry/delete 401'd whenever ADMIN_TOKEN was set —
+   which it always is outside throwaway local dev. sessionStorage: available
+   to every fetch call below, cleared when the tab closes, never written to
+   disk like localStorage would be) ---------- */
+function getToken(){ return sessionStorage.getItem("ms_admin_token")||""; }
+function authHeaders(){ const t=getToken(); return t?{"Authorization":"Bearer "+t}:{}; }
+const tokenEl=$("#adminToken");
+if(tokenEl){
+  tokenEl.value=getToken();
+  let _tokenDebounce=null;
+  tokenEl.addEventListener("input",()=>{
+    sessionStorage.setItem("ms_admin_token",tokenEl.value.trim());
+    // The library 401s (documents) or shows nothing new until a valid token
+    // is entered — refresh once typing settles instead of making the user
+    // reload or click something else.
+    clearTimeout(_tokenDebounce);
+    _tokenDebounce=setTimeout(loadLibrary, 400);
+  });
+}
+
+/* ---------- config ---------- */
 async function loadConfig(){
   try{ const c=await (await fetch("/api/config")).json(); const b=$("#llmBadge");
     if(c.llm_configured){ b.textContent="LLM: "+(c.llm_model||c.llm_provider); b.className="ml-auto text-xs px-3 py-1 rounded-full border border-[#cfe8d6] text-[#1f7a43]"; }
     else { b.textContent="No LLM — moments only"; b.className="ml-auto text-xs px-3 py-1 rounded-full border border-[#e7c46a] text-[#8a6d1a] bg-[#fbf2d8]"; }
   }catch{ $("#llmBadge").textContent="API offline"; }
 }
-/* Query scoping: which indexed videos a question searches. Default = all
-   selected; click a chip to include/exclude (e.g. unselect the samples to
-   search only your own uploads). Full mode (/get-started) only. */
+
+/* ---------- library: videos, papers, and decks rendered as ONE list ----------
+   /api/videos is public (no token needed) and covers videos, including the
+   is_sample flag samples-are-protected logic depends on — so it's always
+   fetched. /admin/sources covers every kind (token-gated) and is the ONLY
+   source for documents; when no token is set it 401s and this quietly shows
+   just the videos, same as before this list was unified. Fetching both
+   together (instead of on two independent polling timers, as before) means
+   one reconciliation pass against SELECTED/KNOWN is enough — no more risk of
+   a video-only poll dropping a document's selection state or vice versa. */
 let SELECTED=new Set(), KNOWN=new Set(), SAMPLE_INDEXED=[];
 const SELECTABLE = ()=> MODE==="full";
-async function loadVideos(){
-  const {videos}=await (await fetch("/api/videos")).json();
-  const box=$("#videos");
-  // Front page (/) shows & queries ONLY the 4 samples; /get-started shows all.
-  const shown = (MODE==="full") ? videos : videos.filter(v=>v.is_sample);
+const pct=v=>v.progress?` ${Math.round(v.progress*100)}%`:"";
+function badge(v){
+  switch(v.status){
+    case "indexed":   return {icon:"✓", label:`${v.frame_count||0}f · ${v.is_sample?"sample":(v.source==="youtube"?"YouTube":"upload")}`, c:"text-[#1f7a43]"};
+    case "pending":   return {icon:"◷", label:"waiting (fair queue)", c:"text-[#8a6d1a]"};
+    case "queued":    return {icon:"◷", label:"queued",           c:"text-[#8a6d1a]"};
+    case "fetching":  return {icon:"⏬", label:"fetching video…",  c:"text-[#8a6d1a]"};
+    case "sampling":  return {icon:"⏳", label:"sampling"+pct(v),  c:"text-[#8a6d1a]"};
+    case "embedding": return {icon:"⏳", label:"embedding"+pct(v), c:"text-[#8a6d1a]"};
+    case "failed":    return {icon:"⚠", label:"failed",           c:"text-danger"};
+    case "skipped":   return {icon:"⊘", label:"duplicate",        c:"text-muted"};
+    default:          return {icon:"•", label:v.status,           c:"text-muted"};
+  }
+}
+function docBadge(d){
+  switch(d.status){
+    case "indexed":   return {icon:"✓", label:`${d.chunk_count||0} chunks`, c:"text-[#1f7a43]"};
+    case "pending":   return {icon:"◷", label:"waiting (fair queue)", c:"text-[#8a6d1a]"};
+    case "queued":    return {icon:"◷", label:"queued", c:"text-[#8a6d1a]"};
+    case "parsing":   return {icon:"⏬", label:"parsing…", c:"text-[#8a6d1a]"};
+    case "chunking":  return {icon:"⏳", label:"chunking…", c:"text-[#8a6d1a]"};
+    case "embedding": return {icon:"⏳", label:"embedding"+(d.pct!=null?` ${d.pct}%`:""), c:"text-[#8a6d1a]"};
+    case "failed":    return {icon:"⚠", label:"failed", c:"text-danger"};
+    default:          return {icon:"•", label:d.status, c:"text-muted"};
+  }
+}
+function renderChip(it){
+  const isDoc = it.kind==="paper" || it.kind==="deck";
+  const b = isDoc ? docBadge(it) : badge(it);
+  const indexed = it.status==="indexed";
+  const sel = SELECTED.has(it.id);
+  const toggle = SELECTABLE() && indexed;
+  const lead = toggle
+    ? `<span class="mr-1.5">${sel?"☑":"☐"}</span>`
+    : `<span class="mr-1.5 ${b.c}" title="${esc(b.label)}">${b.icon}</span>`;
+  const cls="chip"+(toggle&&!sel?" opacity-40":"");
+  const del = MODE==="full";
+  const retry=(del&&it.status==="failed")
+    ? `<button class="ml-2 text-muted hover:text-accent2" data-retry="${esc(it.id)}" title="Retry ingest">↻</button>` : "";
+  const trash=(del&&!it.is_sample)
+    ? `<button class="ml-2 text-muted hover:text-accent2" data-del="${esc(it.id)}" data-title="${esc(it.title||it.id)}" title="Delete permanently">🗑</button>` : "";
+  const attrs=toggle?`data-sel="${esc(it.id)}" title="Click to include or exclude from your search"`:'style="cursor:default"';
+  const icon = isDoc ? (it.kind==="deck"?"📑 ":"📄 ") : "";
+  return `<span class="${cls}" ${attrs}>${lead}${icon}${esc(it.title||it.id)} <span class="${b.c}">· ${esc(b.label)}</span>${retry}${trash}</span>`;
+}
+async function loadLibrary(){
+  const box=$("#library");
+  const {videos:rawVideos}=await (await fetch("/api/videos")).json();
+  const videos = rawVideos.map(v=>({...v, kind:"video"}));
+  let docs=[];
+  if(MODE==="full"){
+    const r=await fetch("/admin/sources",{headers:authHeaders()});
+    if(r.ok){ const {sources}=await r.json(); docs=sources.filter(s=>s.kind!=="video"); }
+  }
+  const shown = (MODE==="full") ? [...videos, ...docs] : videos.filter(v=>v.is_sample);
   SAMPLE_INDEXED = videos.filter(v=>v.is_sample && v.status==="indexed").map(v=>v.id);
+
   if(!shown.length){
     box.innerHTML = MODE==="full"
-      ? '<span class="text-muted text-sm">No videos yet — add one above.</span>'
+      ? '<span class="text-muted text-sm">Nothing yet — add a video, paper, or deck above.</span>'
       : '<span class="text-muted text-sm">The four sample talks index themselves on first start — they’ll appear here in a few minutes.</span>';
-    return shown;
+    $("#scopeLine").classList.add("hidden");
+    return {videos, docs};
   }
-  const del = MODE==="full";
-  // sync selection: new indexed videos default to selected; drop vanished ones
-  const indexedIds=new Set(shown.filter(v=>v.status==="indexed").map(v=>v.id));
+
+  const indexedIds=new Set(shown.filter(it=>it.status==="indexed").map(it=>it.id));
   indexedIds.forEach(id=>{ if(!KNOWN.has(id)){ KNOWN.add(id); SELECTED.add(id); }});
   [...KNOWN].forEach(id=>{ if(!indexedIds.has(id)){ KNOWN.delete(id); SELECTED.delete(id); }});
 
-  const srcLabel=v=>v.is_sample?"sample":(v.source==="youtube"?"YouTube":"upload");
-  const pct=v=>v.progress?` ${Math.round(v.progress*100)}%`:"";
-  // A leading status indicator so each video's state is obvious at a glance.
-  function badge(v){
-    switch(v.status){
-      case "indexed":   return {icon:"✓", label:`${v.frame_count||0}f · ${srcLabel(v)}`, c:"text-[#1f7a43]"};
-      case "pending":   return {icon:"◷", label:"waiting (fair queue)", c:"text-[#8a6d1a]"};
-      case "queued":    return {icon:"◷", label:"queued",           c:"text-[#8a6d1a]"};
-      case "fetching":  return {icon:"⏬", label:"fetching video…",  c:"text-[#8a6d1a]"};
-      case "sampling":  return {icon:"⏳", label:"sampling"+pct(v),  c:"text-[#8a6d1a]"};
-      case "embedding": return {icon:"⏳", label:"embedding"+pct(v), c:"text-[#8a6d1a]"};
-      case "failed":    return {icon:"⚠", label:"failed",           c:"text-coral2"};
-      case "skipped":   return {icon:"⊘", label:"duplicate",        c:"text-muted"};
-      default:          return {icon:"•", label:v.status,           c:"text-muted"};
-    }
-  }
-  box.innerHTML=shown.map(v=>{
-    const indexed=v.status==="indexed";
-    const b=badge(v);
-    const sel=SELECTED.has(v.id);
-    const toggle=SELECTABLE()&&indexed;
-    // For queryable (indexed) videos the front slot is the include/exclude
-    // checkbox; for everything else it's the live status icon.
-    const lead=toggle
-      ? `<span class="mr-1.5">${sel?"☑":"☐"}</span>`
-      : `<span class="mr-1.5 ${b.c}" title="${esc(b.label)}">${b.icon}</span>`;
-    const cls="chip"+(toggle&&!sel?" opacity-40":"");
-    const retry=(del&&v.status==="failed")
-      ? `<button class="ml-2 text-muted hover:text-coral2" data-retry="${esc(v.id)}" title="Retry ingest">↻</button>` : "";
-    const trash=(del&&!v.is_sample)
-      ? `<button class="ml-2 text-muted hover:text-coral2" data-del="${esc(v.id)}" data-title="${esc(v.title||v.id)}" title="Delete permanently">🗑</button>` : "";
-    const attrs=toggle?`data-sel="${esc(v.id)}" title="Click to include or exclude from your search"`:'style="cursor:default"';
-    return `<span class="${cls}" ${attrs}>${lead}${esc(v.title||v.id)} <span class="${b.c}">· ${esc(b.label)}</span>${retry}${trash}</span>`;
-  }).join("");
+  box.innerHTML = shown.map(renderChip).join("");
 
   // clicking a chip toggles include/exclude (but not when a button was clicked)
   box.querySelectorAll("[data-sel]").forEach(el=>el.onclick=(e)=>{
     if(e.target.closest("[data-del],[data-retry]"))return;
     const id=el.dataset.sel;
     SELECTED.has(id)?SELECTED.delete(id):SELECTED.add(id);
-    loadVideos();
+    loadLibrary();
   });
-  // retry a failed ingest — re-queues it on the worker
-  if(del) box.querySelectorAll("[data-retry]").forEach(btn=>btn.onclick=async(e)=>{
+  // retry a failed ingest — re-queues it on the worker (kind-blind: the same
+  // endpoint handles video and document rows, both live in ms_videos)
+  box.querySelectorAll("[data-retry]").forEach(btn=>btn.onclick=async(e)=>{
     e.stopPropagation();
-    await fetch("/api/videos/"+encodeURIComponent(btn.dataset.retry)+"/retry",{method:"POST"});
-    loadVideos(); startRefresher();
+    const r=await fetch("/api/videos/"+encodeURIComponent(btn.dataset.retry)+"/retry",{method:"POST",headers:authHeaders()});
+    if(!r.ok){ const d=await r.json().catch(()=>({})); alert(d.detail||"Retry failed."); return; }
+    loadLibrary(); startRefresher();
   });
   // trash = permanent delete, with a confirm so it's never an accident
-  if(del) box.querySelectorAll("[data-del]").forEach(btn=>btn.onclick=async(e)=>{
+  box.querySelectorAll("[data-del]").forEach(btn=>btn.onclick=async(e)=>{
     e.stopPropagation();
-    if(!confirm(`Delete “${btn.dataset.title}”?\n\nThis permanently removes its frames and search vectors. This can’t be undone.`)) return;
-    const r=await fetch("/api/videos/"+encodeURIComponent(btn.dataset.del),{method:"DELETE"});
+    if(!confirm(`Delete “${btn.dataset.title}”?\n\nThis permanently removes it and its search vectors. This can’t be undone.`)) return;
+    const r=await fetch("/api/videos/"+encodeURIComponent(btn.dataset.del),{method:"DELETE",headers:authHeaders()});
     if(!r.ok){ const d=await r.json().catch(()=>({})); alert(d.detail||"Delete failed."); return; }
-    KNOWN.delete(btn.dataset.del); SELECTED.delete(btn.dataset.del); loadVideos();
+    KNOWN.delete(btn.dataset.del); SELECTED.delete(btn.dataset.del); loadLibrary();
   });
 
   // make the user aware of what's actually being searched
@@ -276,65 +339,130 @@ async function loadVideos(){
     const total=indexedIds.size, on=[...SELECTED].filter(id=>indexedIds.has(id)).length;
     scope.classList.remove("hidden");
     scope.innerHTML = total
-      ? `<b>Searching ${on} of ${total} videos.</b> ☑ click a video to include/exclude it · 🗑 delete permanently (samples can’t be deleted).`
+      ? `<b>Searching ${on} of ${total} items.</b> ☑ click one to include/exclude it · 🗑 delete permanently (samples can’t be deleted).`
       : "";
   } else { scope.classList.add("hidden"); }
-  return videos;
+  return {videos, docs};
 }
 
-/* tabs */
-document.querySelectorAll(".tab").forEach(t=>t.onclick=()=>{
-  document.querySelectorAll(".tab").forEach(x=>x.classList.remove("active")); t.classList.add("active");
-  $("#tab-yt").classList.toggle("hidden",t.dataset.tab!=="yt");
-  $("#tab-up").classList.toggle("hidden",t.dataset.tab!=="up");
-});
-
-/* Ingestion is a QUEUE — register returns 202 instantly and the worker(s)
-   process videos concurrently. So we free the button the moment a video is
-   queued (you can add more right away) and let a single background refresher
-   update the chips until nothing is processing. Per-video progress shows on
-   the chips themselves (sampling… / embedding 40%). */
-const _INFLIGHT=["pending","queued","fetching","sampling","embedding"];
+/* Ingestion is a QUEUE — register/upload returns 202 instantly and the
+   worker(s) process items concurrently. So we free the button the moment
+   something is queued (you can add more right away) and let a single
+   background refresher update the chips until nothing is processing.
+   Per-item progress shows on the chips themselves (sampling… / embedding
+   40%). One refresher now covers videos AND documents together. */
+const _INFLIGHT=["pending","queued","fetching","sampling","embedding","parsing","chunking"];
 let _refresher=null;
 function startRefresher(){
   if(_refresher) return;
   _refresher=setInterval(async()=>{
-    const videos=await loadVideos();
-    if(!videos || !videos.some(v=>_INFLIGHT.includes(v.status))){
+    const {videos,docs}=await loadLibrary();
+    const all=[...(videos||[]),...(docs||[])];
+    if(!all.length || !all.some(it=>_INFLIGHT.includes(it.status))){
       clearInterval(_refresher); _refresher=null;
       $("#ingestStatus").textContent="";
     }
   }, 2500);
 }
-async function registerIngest(body, btns){
+async function registerVideo(body, btns){
   const st=$("#ingestStatus");
   try{
     const resp=await fetch("/api/videos",{method:"POST",
-      headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)});
+      headers:{"Content-Type":"application/json",...authHeaders()}, body:JSON.stringify(body)});
     if(!resp.ok){ const e=await resp.json().catch(()=>({})); throw new Error(e.detail||resp.statusText); }
     await resp.json();
     st.textContent="Queued — processing in the background. Add another anytime.";
-    loadVideos(); startRefresher();
+    loadLibrary(); startRefresher();
   }catch(e){ st.textContent="Error: "+e.message; }
   finally{ btns.forEach(b=>b.disabled=false); }  // free the button immediately
 }
-$("#ytBtn").onclick=()=>{ const u=$("#ytUrl").value.trim(); if(!u)return;
-  $("#ytBtn").disabled=true; $("#ytUrl").value="";   // clear so the field is ready for the next URL
-  registerIngest({url:u},[$("#ytBtn")]); };
-$("#upBtn").onclick=async()=>{ const f=$("#upFile").files[0]; if(!f)return;
-  const st=$("#ingestStatus"); $("#upBtn").disabled=true;
+async function registerDocumentUrl(uri, kind, btns){
+  const st=$("#ingestStatus");
+  try{
+    const resp=await fetch("/admin/documents",{method:"POST",
+      headers:{"Content-Type":"application/json",...authHeaders()}, body:JSON.stringify({uri, kind})});
+    if(!resp.ok){ const e=await resp.json().catch(()=>({})); throw new Error(e.detail||resp.statusText); }
+    await resp.json();
+    st.textContent="Queued — processing in the background. Add another anytime.";
+    loadLibrary(); startRefresher();
+  }catch(e){ st.textContent="Error: "+e.message; }
+  finally{ btns.forEach(b=>b.disabled=false); }
+}
+async function uploadVideoFile(f){
+  const st=$("#ingestStatus");
   try{
     st.textContent="Uploading…";
     const pre=await fetch("/api/videos/presign",{method:"POST",
-      headers:{"Content-Type":"application/json"},
+      headers:{"Content-Type":"application/json",...authHeaders()},
       body:JSON.stringify({filename:f.name,content_type:f.type||"video/mp4",size:f.size})});
     if(!pre.ok){ const e=await pre.json().catch(()=>({})); throw new Error(e.detail||pre.statusText); }
     const p=await pre.json();
     const put=await fetch(p.url,{method:"PUT",headers:p.headers,body:f});
     if(!put.ok) throw new Error("upload failed ("+put.status+")");
-    registerIngest({video_id:p.video_id,key:p.key,title:f.name.replace(/\.[^.]+$/,"")},[$("#upBtn")]);
-    $("#upFile").value="";   // clear so you can pick the next file right away
-  }catch(e){ st.textContent="Error: "+e.message; $("#upBtn").disabled=false; }
+    await registerVideo({video_id:p.video_id,key:p.key,title:f.name.replace(/\.[^.]+$/,"")},[$("#addFileBtn")]);
+  }catch(e){ st.textContent="Error: "+e.message; $("#addFileBtn").disabled=false; }
+}
+async function uploadDocumentFile(f, kind){
+  const st=$("#ingestStatus");
+  st.textContent="Uploading…";
+  try{
+    const body=new FormData();
+    body.append("file", f);
+    body.append("kind", kind || "paper");
+    const r=await fetch("/admin/documents/upload",{method:"POST", headers:authHeaders(), body});
+    if(!r.ok){ const e=await r.json().catch(()=>({})); throw new Error(e.detail||r.statusText); }
+    await r.json();
+    st.textContent="Queued — processing in the background. Add another anytime.";
+    loadLibrary(); startRefresher();
+  }catch(e){ st.textContent="Error: "+e.message; }
+  finally{ $("#addFileBtn").disabled=false; }
+}
+
+/* ---------- one URL field, one file field — MomentSearch figures out what
+   kind of source it is instead of asking the user to pick the right box.
+   A YouTube link registers as a video; anything else registers as a
+   document (paper by default — a small "Paper/Deck" choice appears only
+   once the URL/file is unambiguously a document, since a .pptx is always
+   forced to deck server-side regardless — see src/api/documents.py). ---------- */
+const YT_URL_RE = /(?:youtube\.com\/(?:watch\?v=|shorts\/)|youtu\.be\/)/i;
+const isVideoFile = f => f.type.startsWith("video/") || /\.(mp4|mov|webm|mkv|avi|m4v)$/i.test(f.name);
+const isPptxFile = f => /\.pptx$/i.test(f.name) || f.type.includes("presentationml");
+const isPdfFile = f => f.type==="application/pdf" || /\.pdf$/i.test(f.name);
+
+$("#addUrl").addEventListener("input",()=>{
+  const u=$("#addUrl").value.trim();
+  $("#urlKind").classList.toggle("hidden", !u || YT_URL_RE.test(u));
+});
+$("#addUrlBtn").onclick=()=>{
+  const u=$("#addUrl").value.trim(); if(!u) return;
+  $("#addUrlBtn").disabled=true;
+  if(YT_URL_RE.test(u)){
+    $("#addUrl").value="";
+    registerVideo({url:u},[$("#addUrlBtn")]);
+  } else {
+    const kind=$("#urlKind").value;
+    $("#addUrl").value=""; $("#urlKind").classList.add("hidden");
+    registerDocumentUrl(u, kind, [$("#addUrlBtn")]);
+  }
+};
+$("#addFile").addEventListener("change",()=>{
+  const f=$("#addFile").files[0];
+  $("#fileKind").classList.toggle("hidden", !(f && isPdfFile(f) && !isVideoFile(f)));
+});
+$("#addFileBtn").onclick=async()=>{
+  const f=$("#addFile").files[0]; if(!f) return;
+  const st=$("#ingestStatus");
+  $("#addFileBtn").disabled=true;
+  if(isVideoFile(f)){
+    await uploadVideoFile(f);
+  } else if(isPdfFile(f) || isPptxFile(f)){
+    await uploadDocumentFile(f, $("#fileKind").value);
+  } else {
+    st.textContent="Unsupported file — use a video, PDF, or PPTX.";
+    $("#addFileBtn").disabled=false;
+    return;
+  }
+  $("#addFile").value=""; $("#fileKind").classList.add("hidden");
 };
 
 /* ---------- ask ---------- */
@@ -357,10 +485,10 @@ $("#go").onclick=async()=>{
     let html="";
     if(r.answer) html+=`<div class="prose-body fade-in">${renderMarkdown(r.answer)}</div>`;
     if(r.note) html+=`<p class="text-xs text-muted mt-3">${esc(r.note)}</p>`;
-    if(!r.answer && !CITES.length) html=`<p class="text-muted">No matching moments. Add a video first.</p>`;
+    if(!r.answer && !CITES.length) html=`<p class="text-muted">No matching moments. Add something to your library first.</p>`;
     $("#article").innerHTML=html;
     renderSources();
-  }catch(e){ $("#article").innerHTML=`<p class="text-coral2">Error: ${esc(e.message)}</p>`; }
+  }catch(e){ $("#article").innerHTML=`<p class="text-danger">Error: ${esc(e.message)}</p>`; }
   finally{ $("#go").disabled=false; $("#go").textContent="→"; }
 };
 
@@ -368,23 +496,28 @@ function renderSources(){
   $("#sources").innerHTML=CITES.map(c=>{
     const mods=(c.modalities||[]);
     const tags=mods.map(m=>m==="frame"
-      ? '<span class="text-[9px] px-1 rounded bg-coral/15 text-coral2">seen</span>'
+      ? '<span class="text-[9px] px-1 rounded bg-accent/15 text-accent2">seen</span>'
       : '<span class="text-[9px] px-1 rounded bg-[#cfe8d6] text-[#1f7a43]">said</span>').join(" ");
-    // Text-only moments have no frame; they're always YouTube, so fall back to
-    // the video's thumbnail instead of an empty "(no frame)" placeholder.
+    // Text-only VIDEO moments have no frame but are always YouTube, so fall
+    // back to the video's thumbnail instead of an empty "(no frame)"
+    // placeholder. Documents never have a frame at all — a page/slide number
+    // placeholder instead, not the video-shaped fallback below.
+    const isDoc = c.kind==="paper"||c.kind==="deck";
     const yid = ytId(c);
-    const img = c.thumbnail || (yid ? `https://img.youtube.com/vi/${yid}/hqdefault.jpg` : null);
+    const img = c.thumbnail || (!isDoc && yid ? `https://img.youtube.com/vi/${yid}/hqdefault.jpg` : null);
     const thumb = img
       ? `<img loading="lazy" src="${esc(img)}" class="w-full h-full object-cover" onerror="this.style.opacity=0">`
-      : `<div class="w-full h-full flex items-center justify-center text-muted text-xs p-2 text-center">transcript moment<br>(no frame)</div>`;
+      : isDoc
+        ? `<div class="w-full h-full flex items-center justify-center text-muted text-xs p-2 text-center">${c.kind==="deck"?"📑":"📄"} ${esc(c.timestamp)}</div>`
+        : `<div class="w-full h-full flex items-center justify-center text-muted text-xs p-2 text-center">transcript moment<br>(no frame)</div>`;
     const quote = c.transcript
       ? `<div class="text-[11px] text-muted italic mt-1 line-clamp-2">“${esc(c.transcript)}”</div>` : "";
     return `
-    <button class="source text-left bg-card border border-line rounded-2xl overflow-hidden shadow-sm hover:border-coral transition" data-n="${c.n}">
+    <button class="source text-left bg-card border border-line rounded-2xl overflow-hidden shadow-sm hover:border-accent transition" data-n="${c.n}">
       <div class="aspect-video bg-paper2 overflow-hidden">${thumb}</div>
       <div class="p-3">
         <div class="flex items-center gap-2 mb-1">
-          <span class="text-[10px] font-bold text-white bg-coral rounded px-1.5 py-0.5">${c.n}</span>
+          <span class="text-[10px] font-bold text-white bg-accent rounded px-1.5 py-0.5">${c.n}</span>
           <span class="text-[11px] text-muted">${esc(c.timestamp)}</span>
           ${tags}
           <span class="text-[11px] text-muted ml-auto">score ${c.score}</span>
@@ -401,22 +534,31 @@ function ytId(c){ if(c.video_id&&c.video_id.startsWith("yt_")) return c.video_id
   const m=(c.url||"").match(/(?:youtu\.be\/|v=)([\w-]{11})/); return m?m[1]:null; }
 function playCitation(n){
   const c=CITES.find(x=>x.n===n); if(!c)return;
+  const isDoc = c.kind==="paper"||c.kind==="deck";
   const secs=Math.floor((c.ms||0)/1000);
   $("#mTitle").textContent=c.title||c.video_id;
   $("#mMeta").textContent = c.transcript ? `“${c.transcript}”` : `Moment at ${c.timestamp}`;
-  const box=$("#playerBox"); const yid=ytId(c);
+  const box=$("#playerBox"); const yid=isDoc?null:ytId(c);
   // Frame preview if we have one; otherwise (text-only YouTube moment) the
-  // video's thumbnail, so the modal never shows an empty preview.
-  const preview = c.thumbnail || (yid ? `https://img.youtube.com/vi/${yid}/hqdefault.jpg` : null);
+  // video's thumbnail, so the modal never shows an empty preview. Documents
+  // never have a frame — the PDF itself is the "preview" (rendered below).
+  const preview = isDoc ? null : (c.thumbnail || (yid ? `https://img.youtube.com/vi/${yid}/hqdefault.jpg` : null));
   $("#mFrame").style.display = preview ? "" : "none";
   if(preview) $("#mFrame").src = preview;
   const isFrame = !!c.thumbnail;
-  $("#mFrameLabel").textContent = isFrame ? "Matched frame" : "Matched on transcript";
+  $("#mFrameLabel").textContent = isFrame ? "Matched frame" : (isDoc ? "Matched on text" : "Matched on transcript");
   $("#mFrameDesc").textContent = isFrame
     ? "This is what CLIP matched your question against — the still it judged closest to what you asked."
-    : "This moment matched on what was said (transcript). Shown is the video’s thumbnail — press play to jump to the exact spot.";
+    : isDoc
+      ? "This moment matched the document's extracted text. Press play to open the PDF at the matching page/slide."
+      : "This moment matched on what was said (transcript). Shown is the video’s thumbnail — press play to jump to the exact spot.";
   $("#mOut").href=c.deeplink||"#";
-  if(yid){
+  if(isDoc){
+    const src = c.deeplink || c.doc_url || "";
+    box.innerHTML = src
+      ? `<iframe class="w-full h-full bg-white" src="${esc(src)}" title="document"></iframe>`
+      : `<div class="w-full h-full flex items-center justify-center text-muted text-sm p-4 text-center">No preview available for this document.</div>`;
+  } else if(yid){
     box.innerHTML=`<iframe class="w-full h-full" src="https://www.youtube.com/embed/${yid}?start=${secs}&autoplay=1&rel=0"
       title="moment" frameborder="0" allow="autoplay; encrypted-media; picture-in-picture" allowfullscreen></iframe>`;
   } else {
@@ -439,7 +581,7 @@ const EXAMPLES=["a diagram of the attention mechanism","an animation of a neural
 $("#examples").innerHTML=EXAMPLES.map(q=>`<span class="chip">${esc(q)}</span>`).join("");
 $("#examples").querySelectorAll(".chip").forEach(c=>c.onclick=()=>{ qEl.value=c.textContent; autogrow(); qEl.focus(); });
 
-applyMode(); loadConfig(); loadVideos();
+applyMode(); loadConfig(); loadLibrary();
 </script>
 </body>
 </html>

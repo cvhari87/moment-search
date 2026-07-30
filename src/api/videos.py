@@ -5,7 +5,8 @@ Upload flow (gigabytes never touch this process):
                                    the key: uploads/{user}/{id}.{ext})
   2. browser PUTs the file straight to object storage
   3. POST /api/videos           -> HEAD-verify the object, insert a pending
-                                   Postgres row, schedule a Prefect run, 202
+                                   Postgres row, 202 — src/dispatcher.py
+                                   admits it and schedules the Prefect run
 
 YouTube flow: POST /api/videos {"url": ...} — the worker downloads it.
 
@@ -22,12 +23,14 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from pydantic import BaseModel
 
-from .. import config, db, jobs, storage
+from .. import db, storage
 from ..samples import is_sample
 from ..config import (
     ADMIN_TOKEN,
     ALLOWED_UPLOAD_TYPES,
     DEFAULT_USER_ID,
+    DEPLOYMENT_ENV,
+    INFLIGHT_STATUSES,
     MAX_UPLOAD_MB,
     UPLOAD_KEY_PREFIX,
 )
@@ -124,6 +127,10 @@ def register(req: RegisterRequest, uid: str = Depends(user_id)):
         row = db.upsert_pending({"id": video_id, "user_id": uid, "source": "youtube",
                                  "url": req.url, "storage_key": None,
                                  "source_hash": video_id, "title": req.title})
+        # YouTube fetches happen fresh over HTTPS at ingest time and never
+        # touch our own storage, so no storage_env pin — any environment's
+        # worker can run this one (see db.claim_pending / the column's
+        # comment in db.SCHEMA).
     elif req.video_id and req.key:
         # Never trust the client's key: it must be the one WE minted for them.
         if not req.key.startswith(f"{UPLOAD_KEY_PREFIX}{uid}/{req.video_id}"):
@@ -137,16 +144,23 @@ def register(req: RegisterRequest, uid: str = Depends(user_id)):
         title = req.title or Path(req.key).stem
         row = db.upsert_pending({"id": req.video_id, "user_id": uid, "source": "upload",
                                  "url": None, "storage_key": req.key,
-                                 "source_hash": None, "title": title})
+                                 "source_hash": None, "title": title,
+                                 "storage_env": DEPLOYMENT_ENV})
     else:
         raise HTTPException(400, "Provide either url (YouTube) or video_id+key (upload).")
 
-    # Fair dispatch (WFQ): leave it `pending` — the dispatcher admits it in fair
-    # order (src/dispatcher.py). FIFO mode: enqueue to Prefect immediately.
-    if config.ENABLE_FAIR_DISPATCH:
-        return {"video_id": row["id"], "status": "pending"}
-    flow_run_id = jobs.enqueue_video(row["id"], uid)
-    return {"video_id": row["id"], "status": row["status"], "flow_run_id": flow_run_id}
+    # Always leave it for the dispatcher (src/dispatcher.py) to admit — never
+    # enqueue directly here. A direct enqueue plus this row still reading
+    # `pending` used to race the dispatcher's own claim (both would admit it,
+    # producing two Prefect runs for one video): enqueue_video() doesn't
+    # itself update status, and Prefect scheduling latency can easily exceed
+    # one dispatcher tick. ENABLE_FAIR_DISPATCH now only selects WFQ vs FIFO
+    # ordering inside db.wfq_claim, not which path enqueues.
+    # row["status"], not a hardcoded "pending": upsert_pending leaves an
+    # already in-flight row's status untouched (see its docstring) rather
+    # than resetting it, so a re-registration of something already running
+    # correctly reports its real state instead of falsely claiming "pending".
+    return {"video_id": row["id"], "status": row["status"]}
 
 
 # ── Status / lifecycle ─────────────────────────────────────────────────────────
@@ -165,7 +179,14 @@ def _public(row: dict) -> dict:
 
 @router.get("")
 def list_videos(uid: str = Depends(user_id), status: str | None = None):
-    return {"videos": [_public(r) for r in db.list_videos(uid, status=status)]}
+    # db.list_videos() is kind-agnostic (also used by GET /admin/sources, which
+    # correctly wants every kind) — this endpoint is video-specific, so filter
+    # here. Without this, papers/decks showed up in the UI's "Your videos"
+    # panel mislabeled with a nonsensical frame_count/upload badge. Full
+    # multi-kind rendering is Block F's job; this just keeps this endpoint
+    # honest about what it's named.
+    rows = [r for r in db.list_videos(uid, status=status) if r.get("kind", "video") == "video"]
+    return {"videos": [_public(r) for r in rows]}
 
 
 @router.get("/{video_id}")
@@ -181,18 +202,26 @@ def retry(video_id: str, uid: str = Depends(user_id)):
     row = db.get_video(video_id)
     if row is None or row["user_id"] != uid:
         raise HTTPException(404, "Video not found.")
+    if row["status"] in INFLIGHT_STATUSES:
+        # Already running — resetting to pending here would let the
+        # dispatcher admit a SECOND run for the same row (the same race
+        # upsert_pending's ON CONFLICT now guards against; retry needs its
+        # own guard since it calls set_status directly, not upsert_pending).
+        return {"video_id": video_id, "status": row["status"]}
     db.set_status(video_id, "pending", error=None)
-    if config.ENABLE_FAIR_DISPATCH:
-        return {"video_id": video_id, "status": "pending"}  # dispatcher re-admits it fairly
-    flow_run_id = jobs.enqueue_video(video_id, uid)
-    return {"video_id": video_id, "status": "pending", "flow_run_id": flow_run_id}
+    return {"video_id": video_id, "status": "pending"}  # dispatcher re-admits it (see register())
 
 
 @router.delete("/{video_id}", dependencies=[Depends(require_auth)])
 def delete(video_id: str, uid: str = Depends(user_id)):
-    """Deleting a video purges everything: vectors, thumbnails, the raw upload,
-    and the manifest row — batch calls where the provider supports them.
-    Sample videos are protected (unselect them from a query instead)."""
+    """Deleting a source purges everything: vectors, thumbnails/checkpoints,
+    the raw upload, and the manifest row — batch calls where the provider
+    supports them. Sample videos are protected (unselect them from a query
+    instead). Kind-blind on purpose (see module docstring): a document row's
+    storage_key (if it was an upload, not a URL registration) is cleaned up
+    by the SAME storage_key branch a video's upload is, and its parse/chunk
+    checkpoints (docs/{user}/{id}/*.json) are the document-specific artifact
+    a video row never has."""
     if is_sample(video_id):
         raise HTTPException(403, "Sample videos can't be deleted — unselect it "
                                  "from your query instead.")
@@ -203,5 +232,8 @@ def delete(video_id: str, uid: str = Depends(user_id)):
     storage.delete_prefix(storage.frame_prefix(uid, video_id))
     if row.get("storage_key"):
         storage.delete_key(row["storage_key"])
+    if row.get("kind", "video") != "video":
+        from ..ingest.document import doc_prefix
+        storage.delete_prefix(doc_prefix(uid, video_id))
     db.delete_video(video_id)
     return {"ok": True, "video_id": video_id}

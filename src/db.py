@@ -12,7 +12,7 @@ from typing import Any
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
-from .config import DATABASE_URL, INFLIGHT_STATUSES
+from .config import DATABASE_URL, DEPLOYMENT_ENV, INFLIGHT_STATUSES
 
 _pool: ConnectionPool | None = None
 _pool_pid: int | None = None
@@ -41,6 +41,7 @@ CREATE TABLE IF NOT EXISTS ms_videos (
     source       TEXT NOT NULL,              -- youtube | upload
     url          TEXT,                       -- YouTube URL (source=youtube)
     storage_key  TEXT,                       -- uploads/<user>/<id>.<ext> (source=upload)
+    view_storage_key TEXT,                   -- browser-viewable derivative (e.g. converted PPTX PDF)
     source_hash  TEXT,                       -- sha256 of the file / yt video id
     title        TEXT,
     status       TEXT NOT NULL DEFAULT 'pending',
@@ -67,28 +68,183 @@ CREATE TABLE IF NOT EXISTS ms_user_llms (
     api_key    TEXT,                            -- optional (vLLM often has none)
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Multi-source manifest migration: one shared table for every source kind
+-- (video | paper | deck), not a second table — this is what lets the WFQ
+-- dispatcher and wfq_claim() generalize to documents with zero rewrite.
+-- ADD COLUMN IF NOT EXISTS is idempotent whether the table is brand new or
+-- already has rows; the DEFAULT keeps every pre-existing video row valid.
+ALTER TABLE ms_videos ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'video';
+ALTER TABLE ms_videos ADD COLUMN IF NOT EXISTS uri TEXT;
+ALTER TABLE ms_videos ADD COLUMN IF NOT EXISTS chunk_count INT;
+ALTER TABLE ms_videos ADD COLUMN IF NOT EXISTS view_storage_key TEXT;
+CREATE INDEX IF NOT EXISTS ms_videos_kind_idx ON ms_videos (kind);
+
+-- Crash-safety reconciler (Block G): a lease token bumped on every admission
+-- (wfq_claim). Every status/progress/attempts write a flow makes carries the
+-- generation it was admitted under, gated by this column — so if the
+-- reconciler resets a row to 'pending' while an old, still-alive run is mid-
+-- write, and a new run gets admitted (bumping generation again) before the
+-- old one finishes, the old run's writes silently no-op instead of clobbering
+-- the new run's progress. See db.set_status's docstring.
+ALTER TABLE ms_videos ADD COLUMN IF NOT EXISTS generation INT NOT NULL DEFAULT 0;
+
+-- Cross-environment collision fix: local dev and the Fly.io deployment share
+-- this SAME Postgres manifest (and the same Prefect Cloud workspace) but have
+-- INCOMPATIBLE storage backends (local disk vs. Tigris/S3). Namespacing
+-- Prefect deployment names by environment (src/config.py's DEPLOYMENT_ENV)
+-- only fixes which environment's WORKERS execute a scheduled run — it does
+-- nothing to stop the WRONG environment's dispatcher from CLAIMING a pending
+-- row in the first place, since claim_pending()'s admission query has no
+-- notion of "where do this row's bytes actually live." Found live: a
+-- Fly-claimed row for a locally-uploaded document, scheduled onto Fly's own
+-- deployment, executed by a Fly worker whose Tigris bucket never had the
+-- bytes — genuine botocore NoSuchKey, not a resilience bug.
+-- NULL = unconstrained (URI-registered sources fetch fresh over HTTPS at
+-- ingest time and never touch our own storage, so ANY environment's worker
+-- can run them safely — narrowing them to one environment would only cost
+-- capacity for no correctness benefit). Set only for bytes-in-hand uploads
+-- (storage_key rows), to the uploading process's own DEPLOYMENT_ENV.
+ALTER TABLE ms_videos ADD COLUMN IF NOT EXISTS storage_env TEXT;
 """
+
+# Advisory-lock key for schema init. Arbitrary but stable — must not collide
+# with other pg_advisory_lock callers in this Postgres instance.
+_SCHEMA_LOCK_KEY = 833271
 
 
 def init_schema() -> None:
+    """Both api and worker call this independently at boot. Without
+    coordination, concurrent first-time `CREATE TABLE IF NOT EXISTS` calls can
+    race on Postgres's own system catalogs — observed in practice as
+    `UniqueViolation: duplicate key ... pg_type_typname_nsp_index`, not just a
+    theoretical risk. A container restart policy can mask the crash (the loser
+    just retries and finds the table already there), which makes it look safe
+    when it isn't.
+
+    pg_advisory_xact_lock is transaction-scoped: it's held for exactly the
+    connection block below and releases automatically on commit OR rollback,
+    so a crash mid-migration can never leave the lock stuck.
+    """
     with pool().connection() as conn:
+        conn.execute("SELECT pg_advisory_xact_lock(%s)", (_SCHEMA_LOCK_KEY,))
         conn.execute(SCHEMA)
+    backfill_pptx_view_storage_keys()
+
+
+def backfill_pptx_view_storage_keys() -> int:
+    """Populate viewer keys for PPTX decks indexed before Block M's manifest
+    column existed.
+
+    A deck row alone does not prove its source was PPTX (PDF decks use the
+    same kind), so this migration cannot safely reconstruct keys with a blind
+    SQL update. Probe the deterministic conversion checkpoint and validate
+    its bounded bytes before persisting it. The conditional UPDATE makes this
+    idempotent when API and worker processes start concurrently.
+    """
+    # Lazy imports keep the DB module independent of object-storage clients at
+    # import time and avoid adding their optional provider SDKs to schema-only
+    # callers until the migration actually has candidates to inspect.
+    from . import storage
+    from .config import DOCUMENT_MAX_CONVERTED_MB
+    from .ingest.detect import converted_pdf_key
+
+    with pool().connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, user_id, kind
+            FROM ms_videos
+            WHERE kind = 'deck'
+              AND status = 'indexed'
+              AND view_storage_key IS NULL
+            """
+        ).fetchall()
+
+    if not rows:
+        return 0
+
+    max_bytes = DOCUMENT_MAX_CONVERTED_MB * 1024 * 1024
+    backfilled = 0
+    for row in rows:
+        key = converted_pdf_key(row["user_id"], row["id"], row["kind"])
+        try:
+            meta = storage.head(key)
+            size = int(meta.get("size", 0)) if meta is not None else 0
+            if size <= 0 or size > max_bytes:
+                continue
+            data = storage.get_bytes(key)
+            if len(data) > max_bytes or not data.startswith(b"%PDF"):
+                continue
+        except Exception as exc:
+            print(f"[schema] could not verify legacy PPTX derivative {key}: "
+                  f"{type(exc).__name__}: {exc}")
+            continue
+
+        with pool().connection() as conn:
+            result = conn.execute(
+                """
+                UPDATE ms_videos
+                SET view_storage_key = %s, updated_at = now()
+                WHERE id = %s
+                  AND kind = 'deck'
+                  AND status = 'indexed'
+                  AND view_storage_key IS NULL
+                """,
+                (key, row["id"]),
+            )
+            backfilled += max(result.rowcount, 0)
+
+    if backfilled:
+        print(f"[schema] backfilled {backfilled} legacy PPTX viewer key(s)")
+    return backfilled
 
 
 def upsert_pending(video: dict[str, Any]) -> dict:
-    """Insert a video as pending; re-submitting an existing id resets it."""
+    """Insert a source (video, paper, or deck) as pending; re-submitting an
+    existing id resets it to pending — UNLESS a run is already actively
+    in-flight for it, in which case status/error/progress are left alone.
+
+    Without that guard, re-registering something already running (a real
+    scenario: eval.py's documents_async check re-submits the locked paper,
+    and a user can just double-click Ingest) unconditionally flipped the row
+    back to 'pending', and the dispatcher would fairly re-admit it — while
+    the ORIGINAL run was still executing. Observed live: two distinct Prefect
+    run IDs processing the same doc_id simultaneously, both completing and
+    racing to write the row's terminal status last. Deterministic Qdrant
+    point IDs made the double-embed harmless, but nothing stopped a slower,
+    stale run from overwriting a newer run's 'indexed' with its own (possibly
+    'failed') outcome. `kind` defaults to 'video' so every existing caller
+    (src/api/videos.py) works unchanged; documents pass kind + uri."""
+    video = {"kind": "video", "uri": None, "storage_env": None,
+             "inflight": list(INFLIGHT_STATUSES), **video}
     with pool().connection() as conn:
         row = conn.execute(
             """
-            INSERT INTO ms_videos (id, user_id, source, url, storage_key, source_hash, title, status)
+            INSERT INTO ms_videos (id, user_id, source, url, storage_key, source_hash,
+                                   title, kind, uri, storage_env, status)
             VALUES (%(id)s, %(user_id)s, %(source)s, %(url)s, %(storage_key)s,
-                    %(source_hash)s, %(title)s, 'pending')
+                    %(source_hash)s, %(title)s, %(kind)s, %(uri)s, %(storage_env)s, 'pending')
             ON CONFLICT (id) DO UPDATE SET
                 url = COALESCE(EXCLUDED.url, ms_videos.url),
                 storage_key = COALESCE(EXCLUDED.storage_key, ms_videos.storage_key),
                 source_hash = COALESCE(EXCLUDED.source_hash, ms_videos.source_hash),
                 title = COALESCE(EXCLUDED.title, ms_videos.title),
-                status = 'pending', error = NULL, progress = NULL, updated_at = now()
+                uri = COALESCE(EXCLUDED.uri, ms_videos.uri),
+                -- fresh bytes are (re-)written to THIS process's own storage
+                -- immediately before every upload-path call into this
+                -- function (see documents.py/videos.py), so the newest
+                -- registration's environment always wins, same as kind.
+                storage_env = COALESCE(EXCLUDED.storage_env, ms_videos.storage_env),
+                kind = EXCLUDED.kind,
+                status = CASE WHEN ms_videos.status = ANY(%(inflight)s)
+                              THEN ms_videos.status ELSE 'pending' END,
+                error = CASE WHEN ms_videos.status = ANY(%(inflight)s)
+                             THEN ms_videos.error ELSE NULL END,
+                progress = CASE WHEN ms_videos.status = ANY(%(inflight)s)
+                                THEN ms_videos.progress ELSE NULL END,
+                view_storage_key = CASE WHEN ms_videos.status = ANY(%(inflight)s)
+                                        THEN ms_videos.view_storage_key ELSE NULL END,
+                updated_at = now()
             RETURNING *
             """,
             video,
@@ -99,37 +255,139 @@ def upsert_pending(video: dict[str, Any]) -> dict:
 def set_status(video_id: str, status: str, *, error: str | None = None,
                title: str | None = None, frame_count: int | None = None,
                source_hash: str | None = None, embed_version: str | None = None,
-               progress: float | None = None) -> None:
+               progress: float | None = None, chunk_count: int | None = None,
+               view_storage_key: str | None = None,
+               generation: int | None = None) -> None:
+    """`generation`, when passed, is the lease token (see SCHEMA's comment on
+    the column) a flow run was admitted under — the write becomes a no-op if
+    the row's generation has since moved on (a reconciler resume + a fresh
+    admission happened while this run was still alive). Callers outside a
+    flow (the reconciler's own sweep, the /retry endpoint, upsert_pending)
+    intentionally omit it: those ARE the events that legitimately change
+    admission state, not writers racing to be the last one in.
+
+    Narrow stale-write guard, not a full fencing mechanism on its own: once a row is
+    'indexed', NO further write from this function applies to it UNLESS the
+    new status is 'pending' (the one legitimate way anything un-terminals an
+    indexed row: a fresh, deliberate re-registration through
+    upsert_pending()). This is stronger than an earlier version that only
+    blocked a direct indexed->failed write: a stale run doesn't necessarily
+    fail immediately — it can walk indexed->parsing->embedding->failed,
+    clobbering 'indexed' with 'parsing' well before its own eventual
+    'failed' write, which the narrower check never saw coming since the row
+    was no longer 'indexed' by the time that write happened. Blocking every
+    non-'pending' write while current status is 'indexed' closes that: a
+    stale run's parsing/chunking/embedding/failed calls all become no-ops
+    from the moment a newer run's 'indexed' has landed, not just its last one.
+
+    Still NOT full fencing: this protects the 'indexed' terminal state
+    specifically, not general ordering between two concurrent runs (which
+    deterministic Qdrant point IDs already make safe for duplicate WORK,
+    just not for which run's status write "wins"). A generation/lease token
+    per admission, checked by every status write, is the complete answer —
+    that's Block G's admission-time resilience work, spanning the
+    dispatcher, jobs, and both ingest flows, not a one-function patch."""
     with pool().connection() as conn:
         conn.execute(
             """
-            UPDATE ms_videos SET status = %s, error = %s,
-                title = COALESCE(%s, title),
-                frame_count = COALESCE(%s, frame_count),
-                source_hash = COALESCE(%s, source_hash),
-                embed_version = COALESCE(%s, embed_version),
-                progress = %s,
+            UPDATE ms_videos SET status = %(status)s, error = %(error)s,
+                title = COALESCE(%(title)s, title),
+                frame_count = COALESCE(%(frame_count)s, frame_count),
+                source_hash = COALESCE(%(source_hash)s, source_hash),
+                embed_version = COALESCE(%(embed_version)s, embed_version),
+                progress = %(progress)s,
+                chunk_count = COALESCE(%(chunk_count)s, chunk_count),
+                view_storage_key = COALESCE(%(view_storage_key)s, view_storage_key),
                 updated_at = now()
-            WHERE id = %s
+            WHERE id = %(video_id)s
+              AND (status != 'indexed' OR %(status)s = 'pending')
+              AND (%(generation)s::int IS NULL OR generation = %(generation)s::int)
             """,
-            (status, error, title, frame_count, source_hash, embed_version,
-             progress, video_id),
+            {"status": status, "error": error, "title": title, "frame_count": frame_count,
+             "source_hash": source_hash, "embed_version": embed_version, "progress": progress,
+             "chunk_count": chunk_count, "view_storage_key": view_storage_key,
+             "video_id": video_id, "generation": generation},
         )
 
 
-def set_progress(video_id: str, progress: float) -> None:
+def set_progress(video_id: str, progress: float, *, generation: int | None = None) -> None:
+    """Same 'indexed' guard as set_status() — a stale run's own progress
+    callbacks (video sampling/embedding report progress many times per run)
+    shouldn't cosmetically overwrite an already-indexed row's progress
+    either, even though a stray progress value is lower-severity than a
+    stray status. Same `generation` lease-token gate as set_status()."""
     with pool().connection() as conn:
-        conn.execute("UPDATE ms_videos SET progress = %s, updated_at = now() WHERE id = %s",
-                     (round(progress, 3), video_id))
+        conn.execute(
+            "UPDATE ms_videos SET progress = %(progress)s, updated_at = now() "
+            "WHERE id = %(video_id)s AND status != 'indexed' "
+            "AND (%(generation)s::int IS NULL OR generation = %(generation)s::int)",
+            {"progress": round(progress, 3), "video_id": video_id, "generation": generation},
+        )
 
 
-def bump_attempts(video_id: str) -> int:
+class StaleLeaseError(RuntimeError):
+    """Raised when a flow discovers — at flow start (bump_attempts) or mid-
+    run (check_generation) — that its `generation` lease has been superseded
+    by a newer admission (the reconciler swept this row as stale while THIS
+    run was still alive, and the dispatcher has since re-admitted it under a
+    new generation). This is not an ingest failure: a newer run already owns
+    the row and is the one that should finish it. The caller must stop
+    immediately, before doing any further destructive/overwriting work
+    (deleting or overwriting frames, Qdrant points, or checkpoints) — set_status()'s
+    generation guard alone only protects the STATUS COLUMN, it does nothing
+    to stop the stale run's actual side effects from clobbering the newer
+    run's in-progress state in the meantime. See check_generation()."""
+
+
+def check_generation(video_id: str, generation: int) -> None:
+    """Revalidate a lease mid-task, immediately before a destructive or
+    overwriting side effect (deleting existing frames/Qdrant points,
+    overwriting a checkpoint, upserting chunks). A stale run can otherwise
+    run for minutes past the point its lease was superseded — set_status()'s
+    guard silently no-ops its STATUS writes the whole time, but nothing stops
+    it from continuing to execute and corrupt shared state UNLESS every
+    destructive stage explicitly checks first. Raises StaleLeaseError if the
+    row's current generation no longer matches; a no-op if it still does."""
     with pool().connection() as conn:
         row = conn.execute(
-            "UPDATE ms_videos SET attempts = attempts + 1, updated_at = now() WHERE id = %s RETURNING attempts",
-            (video_id,),
+            "SELECT generation FROM ms_videos WHERE id = %s", (video_id,)
         ).fetchone()
-    return row["attempts"] if row else 0
+    current = row["generation"] if row else None
+    if current != generation:
+        raise StaleLeaseError(
+            f"{video_id}: lease generation {generation} superseded "
+            f"(current={current!r}) — aborting before further side effects")
+
+
+def bump_attempts(video_id: str, *, generation: int | None = None) -> int:
+    """Same `generation` gate as set_status(). Unlike set_status() — where a
+    rejected write silently no-ops because a stray status/progress value is
+    low-severity — a rejected bump here means this run's lease was ALREADY
+    gone before it did any work, so it raises StaleLeaseError instead of
+    quietly returning a number: this is the flow-start check that stops a
+    stale run before t_fetch/t_parse even begins. Raises ValueError if the
+    row is simply gone (deleted mid-run) — a different, real error, not a
+    lease loss."""
+    with pool().connection() as conn:
+        row = conn.execute(
+            "UPDATE ms_videos SET attempts = attempts + 1, updated_at = now() "
+            "WHERE id = %(video_id)s "
+            "AND (%(generation)s::int IS NULL OR generation = %(generation)s::int) "
+            "RETURNING attempts",
+            {"video_id": video_id, "generation": generation},
+        ).fetchone()
+        if row:
+            return row["attempts"]
+        current = conn.execute(
+            "SELECT attempts, generation FROM ms_videos WHERE id = %s", (video_id,)
+        ).fetchone()
+    if current is None:
+        raise ValueError(f"no manifest row for {video_id}")
+    if generation is not None and current["generation"] != generation:
+        raise StaleLeaseError(
+            f"{video_id}: lease generation {generation} superseded "
+            f"(current={current['generation']!r}) — aborting before any work")
+    return current["attempts"]
 
 
 def get_video(video_id: str) -> dict | None:
@@ -187,41 +445,183 @@ def count_inflight() -> int:
     return row["n"] if row else 0
 
 
-def wfq_claim(limit: int) -> list[dict]:
-    """Atomically claim up to `limit` pending videos in FAIR (round-robin across
-    users) order, flipping them pending -> queued. Returns the claimed rows.
+def wfq_claim(limit: int, *, fair: bool = True) -> list[dict]:
+    """Atomically claim up to `limit` pending sources (any kind), flipping
+    them pending -> queued. Returns the claimed rows.
 
-    Fairness: rank each user's pending videos by age (row_number partitioned by
-    user_id), then order by that rank first — so we take everyone's oldest, then
-    everyone's 2nd, ... A user who dumped 50 videos only gets one slot per round,
-    exactly like the others. The UPDATE ... WHERE status='pending' RETURNING is
-    the atomic claim: if two dispatchers race, each row is handed out once.
+    Every source is admitted through here — there is no direct-enqueue path
+    anywhere else (see src/api/videos.py, src/api/documents.py) — because a
+    direct enqueue plus a background claimer racing the same 'pending' row
+    used to schedule two Prefect runs for one source. ENABLE_FAIR_DISPATCH
+    only picks the ORDERING below, never whether this is the admission path.
+
+    fair=True  (ENABLE_FAIR_DISPATCH=true, default): round-robin across
+      users — rank each user's pending sources by age (row_number
+      partitioned by user_id), then order by that rank first, so we take
+      everyone's oldest, then everyone's 2nd, ... A user who dumped 50
+      videos only gets one slot per round, exactly like the others.
+    fair=False (ENABLE_FAIR_DISPATCH=false): plain FIFO by creation time
+      across all users — "useful for A/B teaching the difference" per the
+      module docstring in src/dispatcher.py.
+
+    The UPDATE ... WHERE status='pending' RETURNING is atomic against
+    another dispatcher claiming the SAME row twice, but says nothing about
+    the TOTAL claimed across dispatchers in one tick — see claim_pending()
+    below, which is what src/dispatcher.py actually calls; this function is
+    kept as the row-selection primitive it wraps.
     """
     if limit <= 0:
         return []
+    order_sql = (
+        """
+        SELECT id FROM (
+            SELECT id, row_number() OVER (
+                PARTITION BY user_id ORDER BY created_at, id) AS rn
+            FROM ms_videos WHERE status = 'pending'
+              AND (storage_env IS NULL OR storage_env = %(env)s)
+        ) t
+        ORDER BY rn, id
+        LIMIT %(limit)s
+        """
+        if fair else
+        """
+        SELECT id FROM ms_videos WHERE status = 'pending'
+          AND (storage_env IS NULL OR storage_env = %(env)s)
+        ORDER BY created_at, id
+        LIMIT %(limit)s
+        """
+    )
     with pool().connection() as conn:
-        picked = conn.execute(
-            """
-            SELECT id FROM (
-                SELECT id, row_number() OVER (
-                    PARTITION BY user_id ORDER BY created_at, id) AS rn
-                FROM ms_videos WHERE status = 'pending'
-            ) t
-            ORDER BY rn, id
-            LIMIT %s
-            """,
-            (limit,),
-        ).fetchall()
-        ids = [r["id"] for r in picked]
-        if not ids:
+        return _claim_with_conn(conn, limit, order_sql, env=DEPLOYMENT_ENV)
+
+
+def _claim_with_conn(conn, limit: int, order_sql: str, *, env: str) -> list[dict]:
+    # storage_env IS NULL always matches — see the column's comment in SCHEMA:
+    # URI-registered sources never touch our own storage, so any environment's
+    # worker can run them; only bytes-in-hand uploads are environment-pinned.
+    picked = conn.execute(order_sql, {"env": env, "limit": limit}).fetchall()
+    ids = [r["id"] for r in picked]
+    if not ids:
+        return []
+    return conn.execute(
+        """
+        UPDATE ms_videos SET status = 'queued', generation = generation + 1, updated_at = now()
+        WHERE id = ANY(%s) AND status = 'pending'
+        RETURNING id, user_id, kind, generation
+        """,
+        (ids,),
+    ).fetchall()
+
+
+# Arbitrary fixed key for the WFQ admission critical section below — any
+# int64 works, it just needs to be the same constant everywhere this lock is
+# taken so every dispatcher process (one per worker replica) contends for
+# the SAME advisory lock.
+_DISPATCH_ADVISORY_LOCK_KEY = 0x4D53_5746_51  # "MSWFQ" in hex, arbitrary
+
+
+def claim_pending(cap: int, *, fair: bool = True, env: str | None = None) -> list[dict]:
+    """Atomically compute free capacity AND claim pending sources as ONE
+    locked operation, across every dispatcher process (one per worker
+    replica) — this is what src/dispatcher.py calls, not wfq_claim directly.
+
+    count_inflight() and wfq_claim() used to run as two separate, unlocked
+    reads (each opening its own connection/transaction): dispatcher.py
+    computed `slots = cap - count_inflight()` from one snapshot, then called
+    wfq_claim(slots) moments later. wfq_claim's own UPDATE...WHERE
+    status='pending' RETURNING correctly prevents two dispatchers from
+    claiming the SAME row twice, but says nothing about the TOTAL claimed
+    per tick: two dispatchers reading the same stale inflight count around
+    the same moment could each independently claim up to their OWN computed
+    `slots`, collectively admitting more than `cap` (found in review).
+    Harmless for correctness (Prefect still runs each row once), but it
+    defeats the whole point of sizing DISPATCH_MAX_INFLIGHT to actual
+    capacity (Block N/I).
+
+    A Postgres advisory transaction lock (released automatically on commit
+    or rollback, so a crashed dispatcher can never leave it held) serializes
+    the whole count-then-claim sequence across every connection/process —
+    only one dispatcher, anywhere, can be inside this critical section at
+    once. Cost is negligible: this runs once per DISPATCH_INTERVAL_S per
+    replica and holds the lock for a single count + claim query, not for
+    the Prefect scheduling calls that follow (those happen after this
+    function returns, outside the lock)."""
+    if cap <= 0:
+        return []
+    env = env if env is not None else DEPLOYMENT_ENV
+    order_sql = (
+        """
+        SELECT id FROM (
+            SELECT id, row_number() OVER (
+                PARTITION BY user_id ORDER BY created_at, id) AS rn
+            FROM ms_videos WHERE status = 'pending'
+              AND (storage_env IS NULL OR storage_env = %(env)s)
+        ) t
+        ORDER BY rn, id
+        LIMIT %(limit)s
+        """
+        if fair else
+        """
+        SELECT id FROM ms_videos WHERE status = 'pending'
+          AND (storage_env IS NULL OR storage_env = %(env)s)
+        ORDER BY created_at, id
+        LIMIT %(limit)s
+        """
+    )
+    with pool().connection() as conn:
+        conn.execute("SELECT pg_advisory_xact_lock(%s)", (_DISPATCH_ADVISORY_LOCK_KEY,))
+        inflight = conn.execute(
+            "SELECT count(*) AS n FROM ms_videos WHERE status = ANY(%s)",
+            (list(INFLIGHT_STATUSES),),
+        ).fetchone()["n"]
+        slots = cap - inflight
+        if slots <= 0:
             return []
+        return _claim_with_conn(conn, slots, order_sql, env=env)
+
+
+# ── Crash safety / reconciler (Block G) ──────────────────────────────────────
+
+def reconcile_stale(stale_seconds: float, max_attempts: int) -> list[dict]:
+    """Atomically find sources stuck in an in-flight status (queued,
+    fetching/sampling, parsing/chunking, embedding) whose updated_at hasn't
+    moved in `stale_seconds`, and either reset them to 'pending' (dispatcher
+    fairly re-admits, resumes from checkpoint) or, if they've already burned
+    through `max_attempts` flow-run attempts, dead-letter them straight to
+    'failed' instead of resurrecting a source that just keeps crashing the
+    worker. One UPDATE ... RETURNING, no separate SELECT-then-UPDATE — avoids
+    a TOCTOU race against a run that finishes (reaches 'indexed') in the gap
+    between reading and writing.
+
+    Bumps `generation` in this SAME atomic write — load-bearing, not
+    optional. Without it, a row reset to 'pending' keeps the OLD run's
+    generation until the dispatcher happens to claim it (wfq_claim() is the
+    only other generation-bumping site), which can be seconds away. In that
+    window, an old run that's actually still alive (a false-positive
+    staleness read, not a real crash) still holds a lease that matches —
+    check_generation()/set_status() would let it keep writing, potentially
+    racing the dispatcher's next admission or, worse, undoing a dead-letter
+    this same call just wrote (status='failed' isn't otherwise generation-
+    protected the way 'indexed' is). Bumping here closes that at the
+    source: by the time this UPDATE commits, ANY generation an old run is
+    still holding is already stale, regardless of whether or when the
+    dispatcher re-admits the row."""
+    with pool().connection() as conn:
         return conn.execute(
             """
-            UPDATE ms_videos SET status = 'queued', updated_at = now()
-            WHERE id = ANY(%s) AND status = 'pending'
-            RETURNING id, user_id
+            UPDATE ms_videos SET
+                status = CASE WHEN attempts >= %(max_attempts)s THEN 'failed' ELSE 'pending' END,
+                error = CASE WHEN attempts >= %(max_attempts)s
+                             THEN 'reconciler: exceeded max ingest attempts after repeated staleness resets'
+                             ELSE error END,
+                generation = generation + 1,
+                updated_at = now()
+            WHERE status = ANY(%(inflight)s)
+              AND updated_at < now() - (%(stale_seconds)s * interval '1 second')
+            RETURNING id, status, kind, attempts, generation
             """,
-            (ids,),
+            {"max_attempts": max_attempts, "inflight": list(INFLIGHT_STATUSES),
+             "stale_seconds": stale_seconds},
         ).fetchall()
 
 

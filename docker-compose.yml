@@ -2,7 +2,7 @@
 # (DATABASE_URL), object storage, Qdrant Cloud, Prefect Cloud for the work
 # queue — so every container here is stateless and disposable.
 #   docker compose up --build
-#   API + UI:        http://localhost:8000
+#   API + UI:        http://localhost:8100
 #   Run/queue view:  https://app.prefect.cloud -> Runs
 # Vector store is Qdrant Cloud via QDRANT_URL in .env. To run a local Qdrant
 # instead, add a qdrant service here and blank QDRANT_URL.
@@ -13,15 +13,38 @@ services:
   # GPU machine later — only CLIP_SERVICE_URL changes).
   clip:
     build: .
-    command: uvicorn src.clip_service:app --host 0.0.0.0 --port 8001
+    # Block K: --workers 3 — a single process serialized every embed_docs
+    # call (bulk paper/deck text embedding, not just CLIP) behind one
+    # process-wide _text_lock (src/rag/embeddings.py), so scaling worker
+    # replicas never increased embedding throughput — both replicas' calls
+    # still funneled through this one lock. 3 processes = 3 independent
+    # locks (each still internally TEXT_EMBED_THREADS-capped) = genuine
+    # parallel embedding. Not higher: each process loads its own full model
+    # copy (~1.4GB measured), and this container's memory limit is shared
+    # with api/worker/worker on one Docker Desktop VM.
+    command: uvicorn src.clip_service:app --host 0.0.0.0 --port 8001 --workers 3
     env_file: .env
+    environment:
+      # Block I: this is the process that holds the bge model in-process
+      # for BULK ingest embedding (embed_docs_local — see src/clip_service.py,
+      # src/rag/embeddings.py); the worker calls it over HTTP instead of
+      # loading its own copy. Search's query embedding (embed_query_local) is
+      # deliberately NOT here — it runs locally in the API instead, so a
+      # search query never contends with this service's bulk-embedding work
+      # at all. An earlier attempt set this env var on the worker service,
+      # which turned out to be dead code — the worker never holds this model
+      # in-process (found in review). fastembed defaults to using every
+      # visible core per call; a moderate cap keeps one large sub-batch
+      # (TEXT_EMBED_BATCH) from starving this process's OTHER concurrent
+      # work (CLIP's own torch calls, the FastAPI event loop).
+      TEXT_EMBED_THREADS: ${TEXT_EMBED_THREADS:-4}
     volumes:
       - hf_cache:/root/.cache     # model weights cached across restarts
     restart: unless-stopped
 
   # STARTUP GATE — indexes the four sample talks and exits. api + worker wait
   # for it to finish (service_completed_successfully), so the UI is NEVER
-  # reachable with a half-indexed corpus: when localhost:8000 answers, the
+  # reachable with a half-indexed corpus: when localhost:8100 answers, the
   # samples are ready. Idempotent + durable (Qdrant Cloud) — after the first
   # successful run this exits in seconds. First run takes a few minutes
   # (model download + 4 videos); watch its logs: docker compose logs -f seed
@@ -41,7 +64,7 @@ services:
   api:
     build: .
     ports:
-      - "8000:8000"
+      - "8100:8000"
     env_file: .env
     environment:
       CLIP_SERVICE_URL: ${CLIP_SERVICE_URL:-http://clip:8001}
@@ -64,7 +87,11 @@ services:
       # One worker process executes up to WORKER_CONCURRENCY runs at once.
       # With the clip service doing the embedding, each run is light
       # (download + ffmpeg only) — raise this without adding RAM for models.
-      WORKER_CONCURRENCY: 2
+      # Read from .env (via env_file above) rather than hardcoded here —
+      # a fixed value here would silently override .env's WORKER_CONCURRENCY
+      # regardless of what it's set to (found live in Block I: .env had
+      # already been raised to 4 but this hardcoded 2 kept winning).
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-2}
     volumes:
       - ./data:/app/data
       - hf_cache:/root/.cache
@@ -75,7 +102,10 @@ services:
         condition: service_completed_successfully
     restart: unless-stopped
     # Need more throughput? Replicas multiply it (all share the one clip model):
-    # docker compose up -d --scale worker=3   (-> 6 videos at once)
+    #   docker compose up -d --scale worker=2   (-> 4 in flight; DISPATCH_MAX_INFLIGHT
+    #   in .env must equal replicas x WORKER_CONCURRENCY, or the dispatcher caps
+    #   admission below the capacity the extra replica actually provides — see
+    #   src/config.py's DISPATCH_MAX_INFLIGHT comment).
 
 volumes:
   hf_cache:

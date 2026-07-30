@@ -7,6 +7,7 @@ playback stream via presigned URLs and never touch this process.
 """
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 
@@ -15,14 +16,21 @@ from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 
 from .. import config, db, llm, storage
+from ..ingest import detect
 from ..rag import search as rag_search
 from .videos import require_auth, user_id as user_id_dep
 
 router = APIRouter(tags=["search"])
 
 UI_DIR = Path(__file__).resolve().parents[2] / "ui"
+# Regenerated at boot from the tracked corpus/generate_deck.py (see
+# src/app.py's lifespan) — the rendered PDF itself is never committed
+# (ASSIGNMENT_AGENTS.md non-negotiable #7: "media/PDF artifacts are
+# git-ignored"), so this stays under data/, like everything else runtime.
+CORPUS_DIR = config.DATA / "corpus"
 _FRAME_RE = re.compile(r"^\d{6}\.jpg$")
 _USER_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_CORPUS_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}\.pdf$")
 
 
 def _uid(value: str | None) -> str:
@@ -148,6 +156,87 @@ def ask(req: AskRequest, x_user_id: str | None = Header(default=None)):
                           video_ids=video_ids)
 
 
+@router.get("/admin/debug/retrieve", dependencies=[Depends(require_auth)])
+def debug_retrieve(q: str, x_user_id: str | None = Header(default=None)):
+    """Admin-only introspection into Gate 1's raw inputs. Neither /api/ask nor
+    /ask_stream ever returns best_visual/best_text (the public contract has
+    no business exposing threshold internals), but benchmark/calibrate_
+    thresholds.py needs exactly these two numbers against the LIVE index —
+    the same embeddings, the same corpus — to calibrate CONFIDENCE_THRESHOLD
+    / TEXT_CONFIDENCE_THRESHOLD against real separation between labeled
+    positive and negative queries, not a guess."""
+    uid = _uid(x_user_id)
+    r = rag_search.retrieve(q.strip(), uid)
+    return {"best_visual": r["best_visual"], "best_text": r["best_text"],
+            "lexical_hit": r["lexical_hit"], "n_citations": len(r["citations"])}
+
+
+def _sse(data: dict) -> str:
+    return f"data: {json.dumps(data)}\n\n"
+
+
+@router.get("/ask_stream")
+def ask_stream(q: str, top_k: int | None = None, x_user_id: str | None = Header(default=None)):
+    """Assignment-contract SSE endpoint: citations event first (so a client
+    is grounded before the slow part even starts), then the answer — kept
+    entirely separate from POST /api/ask, which is untouched.
+
+    retrieve() (fast: two vector searches + fusion) and answer_from_citations()
+    (slow: the LLM call) are called as two separate steps, not via ask(), so
+    the citations SSE chunk is flushed to the client before the LLM call even
+    begins, not just before its result happens to be serialized.
+
+    `top_k` is optional and defaults to None (config.TOP_K, currently 6) —
+    added so benchmark/bench.py's recall check can literally request 10
+    results for a "recall@10" measurement instead of silently testing
+    whatever the app's own default happens to be. eval.py and every other
+    existing caller omit it and see identical behavior to before."""
+    uid = _uid(x_user_id)
+    question = q.strip()
+
+    def events():
+        if not question:
+            yield _sse({"citations": []})
+            return
+        r = rag_search.retrieve(question, uid, top_k=top_k)
+        # Gate 1 FIRST: a nonsense query can still return top-K nearest
+        # neighbors (vector search always returns something), but if neither
+        # branch's best raw score clears the confidence threshold, those
+        # aren't citations — showing them here would contradict the abstain
+        # answer that's about to follow. Same gate answer_from_citations
+        # applies below, so the citations event and the eventual answer can
+        # never disagree about whether anything was actually found.
+        gated = rag_search.gate_citations(r["citations"], r["best_visual"], r["best_text"],
+                                          r["lexical_hit"])
+        # Citations with no retrieved text (e.g. a frame-only visual match)
+        # would zero the assignment's all-or-nothing "grounded" check for
+        # every OTHER citation in the same answer — drop them here. POST
+        # /api/ask still returns them; the UI there renders frame-only
+        # moments fine.
+        #
+        # Renumber after filtering, and — critically — pass THIS exact list
+        # into answer_from_citations() below, not r["citations"]. The LLM's
+        # [n] references are positional over whatever list builds its
+        # `moments` (src/llm.py: enumerate(moments, 1)), so if the answer
+        # were generated from the unfiltered list while the client only saw
+        # the filtered one, "[1]" in the answer could point at a citation
+        # the client never received — the two would disagree about what's
+        # even on the numbered list. Reusing the identical list for both
+        # steps is what keeps them impossible to disagree.
+        grounded_citations = [c for c in gated if c.get("text")]
+        for i, c in enumerate(grounded_citations, 1):
+            c["n"] = i
+        yield _sse({"citations": grounded_citations})
+        result = rag_search.answer_from_citations(
+            question, uid, grounded_citations, r["best_visual"], r["best_text"],
+            r["lexical_hit"])
+        yield _sse({k: v for k, v in result.items() if k != "citations"})
+
+    return StreamingResponse(events(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache",
+                                      "X-Accel-Buffering": "no"})
+
+
 # ── Media (local-dev only; buckets serve these via presigned URLs) ───────────
 
 @router.get("/api/frame/{video_id}/{name}")
@@ -170,7 +259,8 @@ def video(video_id: str, u: str | None = None,
         raise HTTPException(404, "Playback streams from object storage.")
     uid = _uid(u)
     row = db.get_video(video_id)
-    if row is None or row["user_id"] != uid or not row.get("storage_key"):
+    if (row is None or row["user_id"] != uid or not row.get("storage_key")
+            or row.get("kind", "video") != "video"):
         raise HTTPException(404, "Video not found.")
     path = storage.local_path(row["storage_key"])
     if not path.exists():
@@ -208,6 +298,56 @@ def video(video_id: str, u: str | None = None,
                              headers={"Content-Range": f"bytes {start}-{end}/{size}",
                                       "Accept-Ranges": "bytes",
                                       "Content-Length": str(length)})
+
+
+@router.get("/api/document/{doc_id}")
+def document(doc_id: str, u: str | None = None):
+    """Local-dev PDF serving for uploaded papers/decks — the storage_key
+    counterpart to /api/video for documents (a real bucket serves these via
+    presigned URLs instead, from src.rag.search._doc_url, and never reaches
+    this route). Kind-checked so a video id can't be requested here either.
+
+    A PPTX-sourced deck's storage_key is the ORIGINAL .pptx bytes (Block M
+    converts at parse time, not upload time) — viewer_storage_key swaps in
+    the converted PDF checkpoint when one exists, the same substitution
+    _doc_url makes for the presigned-URL path, so this route never serves
+    raw .pptx bytes labeled application/pdf.
+
+    Only requires storage_key OR a converted-PDF checkpoint, not
+    storage_key alone: a URL-registered PPTX (uri, no storage_key) still
+    gets converted at parse time and the result lands in OUR OWN storage
+    the same way an uploaded one's does — requiring storage_key here would
+    404 that checkpoint even though it exists (found in review)."""
+    if storage.presign_capable():
+        raise HTTPException(404, "Document viewing streams from object storage.")
+    uid = _uid(u)
+    row = db.get_video(doc_id)
+    if row is None or row["user_id"] != uid or row.get("kind") not in ("paper", "deck"):
+        raise HTTPException(404, "Document not found.")
+    key = detect.viewer_storage_key(
+        row.get("storage_key"), row.get("view_storage_key"))
+    if not key:
+        raise HTTPException(404, "Document not found.")
+    path = storage.local_path(key)
+    if not path.exists():
+        raise HTTPException(404, "Document file not found.")
+    return FileResponse(path, media_type="application/pdf",
+                        headers={"Cache-Control": "private, max-age=3600"})
+
+
+@router.get("/corpus/{name}")
+def corpus_pdf(name: str):
+    """Serves locally-authored paper/deck PDFs (e.g. our own architecture deck,
+    which has no public URL) so /admin/documents can register them the same
+    way it registers a real https:// paper — one fetch path, no file:// scheme
+    trust boundary in the ingestion pipeline."""
+    if not _CORPUS_NAME_RE.match(name):
+        raise HTTPException(404, "Not found.")
+    fp = CORPUS_DIR / name
+    if not fp.exists() or not fp.is_file():
+        raise HTTPException(404, "Not found.")
+    return FileResponse(fp, media_type="application/pdf",
+                        headers={"Cache-Control": "public, max-age=86400"})
 
 
 # ── UI ────────────────────────────────────────────────────────────────────────

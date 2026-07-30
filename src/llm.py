@@ -126,6 +126,63 @@ def answer(question: str, moments: list[dict], cfg: LLMConfig) -> str:
     return _answer_openai(cfg, question, moments)
 
 
+CAPTION_SYSTEM = (
+    "You transcribe a presentation slide for a search index. Describe its "
+    "content precisely and completely: any title, headings, bullet points, "
+    "body text, labels, numbers, and the substance of any diagram, chart, "
+    "or photo. Plain descriptive text only — no preamble, no meta-"
+    "commentary about being an AI, no markdown."
+)
+_CAPTION_PROMPT = ("Transcribe and describe this slide for a search index: "
+                    "title, headings, bullet points, body text, labels, "
+                    "numbers, and the substance of any diagram or chart.")
+
+
+def caption_image(image: bytes, cfg: LLMConfig) -> str:
+    """One-shot caption of a single image (a rendered slide) for search
+    indexing — same per-provider multimodal plumbing as answer() (client
+    setup, downscaling, base64 encoding), a captioning prompt instead of
+    the video Q&A one, since a slide has no timestamp/transcript to label."""
+    if cfg.provider == "anthropic":
+        return _caption_anthropic(cfg, image)
+    return _caption_openai(cfg, image)
+
+
+def _caption_openai(cfg: LLMConfig, image: bytes) -> str:
+    from openai import OpenAI
+
+    client = OpenAI(api_key=cfg.api_key or "not-needed", base_url=_base_url(cfg))
+    uri = f"data:image/jpeg;base64,{base64.b64encode(_downscale(image)).decode()}"
+    resp = client.chat.completions.create(
+        model=cfg.model,
+        messages=[{"role": "system", "content": CAPTION_SYSTEM},
+                  {"role": "user", "content": [
+                      {"type": "text", "text": _CAPTION_PROMPT},
+                      {"type": "image_url", "image_url": {"url": uri}},
+                  ]}],
+        temperature=0.2,
+        max_tokens=cfg.max_tokens,
+    )
+    return (resp.choices[0].message.content or "").strip()
+
+
+def _caption_anthropic(cfg: LLMConfig, image: bytes) -> str:
+    import anthropic
+
+    client = anthropic.Anthropic(api_key=cfg.api_key, base_url=cfg.base_url or None)
+    resp = client.messages.create(
+        model=cfg.model,
+        max_tokens=cfg.max_tokens,
+        system=CAPTION_SYSTEM,
+        messages=[{"role": "user", "content": [
+            {"type": "text", "text": _CAPTION_PROMPT},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg",
+             "data": base64.b64encode(_downscale(image)).decode()}},
+        ]}],
+    )
+    return "".join(b.text for b in resp.content if b.type == "text").strip()
+
+
 def ping(cfg: LLMConfig) -> str:
     """Connectivity + vision check: one tiny image, one word back. Raises with
     the provider's error on failure (surfaced to the settings UI)."""
