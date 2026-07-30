@@ -1,0 +1,429 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Moment Search at Scale — Learnings</title>
+<style>
+  :root{
+    --ink:#25211c;
+    --sub:#847a6c;
+    --rule:#e3dccc;
+    --rule-soft:#ede7d9;
+    --accent:#a8462c;
+    --accent-dark:#7c3320;
+    --accent-tint:#f5e9e2;
+    --paper:#fbf8f2;
+    --card:#f4efe4;
+    --callout-bg:#f7ede6;
+  }
+  *{box-sizing:border-box;}
+  html,body{margin:0;padding:0;background:#ddd6c6;}
+  @page{size:13.333in 7.5in;margin:0;}
+  @media print{
+    html,body{background:var(--paper);}
+    .deck{width:1280px;}
+    .slide{margin:0;}
+  }
+  body{font-family:-apple-system,BlinkMacSystemFont,"Helvetica Neue",Arial,sans-serif;}
+  .deck{width:1280px;margin:0 auto;}
+  .slide{
+    width:1280px;height:720px;background:var(--paper);position:relative;
+    padding:50px 66px 34px 96px;
+    display:flex;flex-direction:column;
+    page-break-after:always;
+    overflow:hidden;
+  }
+  .slide:last-child{page-break-after:auto;}
+  .slide::before{
+    content:"";position:absolute;left:0;top:0;bottom:0;width:10px;background:var(--accent);
+  }
+  .slide::after{
+    content:attr(data-no) " / 12";
+    position:absolute;right:28px;bottom:20px;
+    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    font-size:11px;color:var(--sub);letter-spacing:.5px;
+  }
+  .tag{display:flex;align-items:center;gap:12px;margin-bottom:22px;}
+  .tag .idx{
+    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    font-size:11px;font-weight:700;color:#fff;background:var(--accent);
+    padding:3px 7px;border-radius:2px;letter-spacing:.5px;
+  }
+  .tag .label{
+    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    font-size:12px;color:var(--accent-dark);letter-spacing:.6px;text-transform:uppercase;
+  }
+  h1.headline{
+    font-family:Palatino,"Palatino Linotype","Iowan Old Style",Georgia,serif;
+    font-weight:400;
+    font-size:35px;
+    line-height:1.22;
+    color:var(--ink);
+    margin:0 0 16px 0;
+    max-width:1060px;
+  }
+  h1.headline .hl{
+    color:var(--accent-dark);
+    box-shadow:inset 0 -0.34em 0 0 var(--accent-tint);
+  }
+  p.subtitle{
+    font-size:16px;line-height:1.55;color:var(--sub);margin:0 0 22px 0;max-width:960px;
+  }
+  .divider{border:none;border-top:1px solid var(--rule);margin:0 0 26px 0;}
+  .cols{display:grid;gap:34px;flex:1;min-height:0;}
+  .cols-2{grid-template-columns:1fr 1fr;}
+  .cols-4{grid-template-columns:repeat(4,1fr);}
+  .cols-2x2{row-gap:26px;column-gap:60px;align-content:start;}
+  .cols-2x2 .col:nth-child(3),.cols-2x2 .col:nth-child(4){border-top:1px solid var(--rule);padding-top:22px;}
+  .col{display:flex;flex-direction:column;}
+  .chip{
+    display:inline-flex;align-items:center;justify-content:center;
+    width:24px;height:24px;border-radius:4px;background:var(--accent);color:#fff;
+    font-size:12px;font-weight:700;margin-bottom:12px;font-family:ui-monospace,Menlo,Consolas,monospace;
+  }
+  .chip.soft{background:var(--rule-soft);color:var(--accent-dark);}
+  .col-tag{font-size:11px;font-weight:700;letter-spacing:.5px;color:var(--accent-dark);text-transform:uppercase;margin-bottom:9px;font-family:ui-monospace,Menlo,Consolas,monospace;}
+  .col-title{font-family:Palatino,"Palatino Linotype",Georgia,serif;font-size:19px;color:var(--ink);margin:0 0 10px 0;font-weight:400;}
+  .col-body{font-size:14px;line-height:1.55;color:#4a4438;}
+  .col-body ul{margin:0;padding-left:16px;}
+  .col-body li{margin-bottom:9px;}
+  .col-body li:last-child{margin-bottom:0;}
+  .col-body b{color:var(--ink);}
+  .col-body code, .callout code{
+    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    font-size:12.5px;background:var(--card);padding:1px 5px;border-radius:3px;color:#3a3428;
+  }
+  .callout{
+    margin-top:20px;padding:15px 20px;border-left:5px solid var(--accent);
+    background:var(--callout-bg);font-size:14.5px;line-height:1.6;color:#3a3428;
+    border-radius:0 3px 3px 0;
+  }
+  .callout .cal-label{
+    display:block;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:10.5px;
+    font-weight:700;letter-spacing:.6px;color:var(--accent-dark);text-transform:uppercase;
+    margin-bottom:6px;
+  }
+  .callout b{color:var(--ink);}
+  .footer-source{
+    margin-top:14px;padding-top:10px;border-top:1px solid var(--rule);
+    font-size:11px;color:#a39a89;
+  }
+  .byline{font-size:14px;color:var(--sub);margin-bottom:22px;}
+  .byline b{color:var(--ink);}
+  .stat-row{display:flex;gap:16px;margin-top:auto;}
+  .stat{
+    flex:1;padding:16px 18px;background:var(--card);border:1px solid var(--rule);border-radius:6px;
+  }
+  .stat-value{font-family:Palatino,"Palatino Linotype",Georgia,serif;font-size:29px;color:var(--accent-dark);margin-bottom:4px;}
+  .stat-label{font-size:12.5px;color:#4a4438;font-weight:600;}
+  .stat-sub{font-size:11.5px;color:var(--sub);margin-top:2px;}
+
+  /* results grid slide */
+  .grid6{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;flex:1;}
+  .cell{border-left:3px solid var(--accent);padding:4px 0 4px 16px;position:relative;}
+  .cell.fail{border-left-color:#b0271a;}
+  .cell-label{font-size:12px;color:#4a4438;margin-bottom:1px;}
+  .cell-target{font-size:11px;color:var(--sub);margin-bottom:10px;}
+  .cell-value{font-family:Palatino,"Palatino Linotype",Georgia,serif;font-size:28px;color:var(--ink);}
+  .cell-value.fail{color:#a83a1e;}
+  .badge{font-size:10.5px;font-weight:700;letter-spacing:.4px;padding:2px 7px;border-radius:3px;margin-left:6px;vertical-align:middle;font-family:ui-monospace,Menlo,Consolas,monospace;}
+  .badge-pass{background:#e6f1e6;color:#2c5c33;}
+  .badge-fail{background:#fbe9e6;color:#a3271a;}
+  .row-divider{grid-column:1/-1;border-top:1px solid var(--rule);margin:4px 0;}
+
+  /* architecture diagram */
+  .arch{border:1px solid var(--rule);border-radius:6px;flex:1;display:flex;flex-direction:column;overflow:hidden;background:#fff;}
+  .arch-band{padding:14px 22px;border-bottom:1px solid var(--rule);}
+  .arch-band:last-child{border-bottom:none;}
+  .arch-band-label{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:10.5px;font-weight:700;color:var(--accent-dark);text-transform:uppercase;letter-spacing:.5px;margin-bottom:10px;}
+  .arch-row{display:flex;align-items:stretch;gap:0;}
+  .arch-box{
+    border:1px solid var(--rule);border-radius:4px;padding:8px 10px;flex:1;background:var(--paper);
+  }
+  .arch-box b{display:block;font-size:12.5px;color:var(--ink);margin-bottom:3px;}
+  .arch-box span{font-size:10.5px;color:var(--sub);line-height:1.4;display:block;}
+  .arch-arrow{display:flex;align-items:center;justify-content:center;width:26px;color:var(--accent);font-size:14px;flex:0 0 26px;}
+  .arch-box.hl{border-color:var(--accent);border-width:1.5px;background:var(--accent-tint);}
+  .state-row{display:flex;gap:16px;}
+  .state-box{flex:1;border:1px solid var(--rule);border-radius:4px;padding:8px 10px;background:var(--paper);}
+  .state-box b{display:block;font-size:12.5px;margin-bottom:3px;}
+  .state-box span{font-size:10.5px;color:var(--sub);}
+  .state-box.hl{border-color:var(--accent);border-width:1.5px;background:var(--accent-tint);}
+</style>
+</head>
+<body>
+<div class="deck">
+
+<!-- SLIDE 1 — TITLE -->
+<section class="slide" data-no="01">
+  <div class="tag"><span class="idx">A3</span><span class="label">Forward Deployed Engineering Bootcamp</span></div>
+  <h1 class="headline" style="font-size:45px;margin-top:56px;">Moment Search at Scale:<br>What Building It <span class="hl">Actually Taught Me</span></h1>
+  <p class="subtitle" style="font-size:17px;">One video, one research paper, and one slide deck answering the same question from a single index — pushed through async queues, killed mid-ingest, and reported honestly where it still hurts.</p>
+  <div class="byline"><b>Hari Chidambaram</b> · July 30, 2026 · corpus: 1 video · 1 paper · 1 deck · 14 labeled queries</div>
+  <div class="stat-row">
+    <div class="stat"><div class="stat-value">132.5 ms</div><div class="stat-label">accept p95</div><div class="stat-sub">target &lt; 300 ms</div></div>
+    <div class="stat"><div class="stat-value">0.929</div><div class="stat-label">recall@10</div><div class="stat-sub">target ≥ 0.70</div></div>
+    <div class="stat"><div class="stat-value">0.788</div><div class="stat-label">MRR@6</div><div class="stat-sub">target ≥ 0.60</div></div>
+    <div class="stat"><div class="stat-value">108 / 108</div><div class="stat-label">tests passing</div><div class="stat-sub">89 unit + 19 benchmark gates</div></div>
+  </div>
+</section>
+
+<!-- SLIDE 2 — PROBLEM & ASK -->
+<section class="slide" data-no="02">
+  <div class="tag"><span class="idx">01</span><span class="label">The problem &amp; the ask</span></div>
+  <h1 class="headline">A single-source video demo has to become a mixed-corpus<br>system that <span class="hl">proves its own honesty</span></h1>
+  <p class="subtitle">Papers and decks carry answers video can't. Bolting on a second system to hold them splits the evidence — so they enter the same queue, land in the same index, and get graded by a benchmark that isn't allowed to grade itself generously.</p>
+  <hr class="divider">
+  <div class="cols cols-4">
+    <div class="col"><span class="chip">1</span><div class="col-title">Multi-source ingestion</div>
+      <div class="col-body">Parse, chunk, and embed PDFs and decks into the same Qdrant collections video already writes to. One manifest, one <code>kind</code> column, one lifecycle for all three.</div></div>
+    <div class="col"><span class="chip">2</span><div class="col-title">Async work queues</div>
+      <div class="col-body">A Postgres WFQ dispatcher admits fairly; Prefect executes what it admits. Registration returns <code>202</code> in ~130ms no matter what's backfilling behind it.</div></div>
+    <div class="col"><span class="chip">3</span><div class="col-title">Cross-source retrieval</div>
+      <div class="col-body">One <code>/ask_stream</code> call fuses video, paper, and deck evidence and cites a timestamp, a page, or a slide — never a locator the system invented.</div></div>
+    <div class="col"><span class="chip">4</span><div class="col-title">Prove it, don't assert it</div>
+      <div class="col-body">Every number in this deck traces to a script under <code>benchmark/</code> or <code>eval/</code> that anyone can re-run — including the two that failed.</div></div>
+  </div>
+  <div class="callout"><span class="cal-label">The bar</span>Set by the assignment, not by us: <b>accept p95 &lt; 300 ms · search ≤ 1.3× under backfill · recall@10 ≥ 0.70 · MRR@6 ≥ 0.60 · zero loss on a killed worker</b>.</div>
+</section>
+
+<!-- SLIDE 3 — ARCHITECTURE -->
+<section class="slide" data-no="03">
+  <div class="tag"><span class="idx">02</span><span class="label">Architecture at a glance</span></div>
+  <h1 class="headline">One manifest, one index — <span class="hl">search never waits on the queue</span></h1>
+  <p class="subtitle">Ingestion is slow and bursty; search is fast and read-only. They share state, not a request path.</p>
+  <div class="arch">
+    <div class="arch-band">
+      <div class="arch-band-label">Write path — async, queue-decoupled</div>
+      <div class="arch-row">
+        <div class="arch-box"><b>Clients</b><span>video URL · paper URL · deck URL</span></div>
+        <div class="arch-arrow">→</div>
+        <div class="arch-box hl"><b>FastAPI · accept path</b><span>POST /admin/documents → 202, no PDF library in the request path</span></div>
+        <div class="arch-arrow">→</div>
+        <div class="arch-box"><b>Postgres WFQ dispatcher</b><span>fair admit · only path that submits to Prefect</span></div>
+        <div class="arch-arrow">→</div>
+        <div class="arch-box"><b>Prefect Cloud</b><span>flow run · retries · dashboard</span></div>
+        <div class="arch-arrow">→</div>
+        <div class="arch-box"><b>Ingest worker</b><span>fetch → parse → chunk → embed → index</span></div>
+      </div>
+    </div>
+    <div class="arch-band">
+      <div class="arch-band-label">State — Postgres is the manifest, Qdrant is the meaning</div>
+      <div class="state-row">
+        <div class="state-box"><b>Postgres manifest</b><span>status · attempts · updated_at (the lease) · pending → queued → parsing/chunking → embedding → indexed</span></div>
+        <div class="state-box hl"><b>Qdrant — one index, two collections</b><span>CLIP 512-D visual (frames + rendered pages/slides) · bge text (transcript + page/slide chunks)</span></div>
+      </div>
+    </div>
+    <div class="arch-band">
+      <div class="arch-band-label">Read path — talks only to Qdrant, never to the queue</div>
+      <div class="arch-row">
+        <div class="arch-box"><b>Question</b><span>/ask_stream, natural language</span></div>
+        <div class="arch-arrow">→</div>
+        <div class="arch-box"><b>Embed twice</b><span>CLIP text + bge, always both</span></div>
+        <div class="arch-arrow">→</div>
+        <div class="arch-box"><b>Search + fuse</b><span>both collections, user-filtered · RRF + cross-modal boost</span></div>
+        <div class="arch-arrow">→</div>
+        <div class="arch-box hl"><b>Grounded answer</b><span>confidence gate · citations carry real mm:ss / p. N / slide N</span></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- SLIDE 4 — KEY DECISION 1 -->
+<section class="slide" data-no="04">
+  <div class="tag"><span class="idx">03</span><span class="label">Key design decision · 1 of 2</span></div>
+  <h1 class="headline">We built real <code style="font-size:31px;background:none;padding:0;">.pptx</code> conversion — and it created<br><span class="hl">a bug the tests couldn't see</span></h1>
+  <p class="subtitle">Rendering PowerPoint faithfully means a LibreOffice conversion step before parsing. Getting the bytes indexed was the easy 80% of the feature; making sure a citation could still be <i>viewed</i> was the part no existing test asked about.</p>
+  <hr class="divider">
+  <div class="cols cols-2">
+    <div class="col"><span class="chip">A</span><div class="col-title">What indexing needed</div>
+      <div class="col-body"><ul>
+        <li>A PPTX's <code>storage_key</code> deliberately keeps pointing at the <b>original bytes</b> — a re-parse after a <code>PARSE_VERSION</code> bump always has true source material, not a lossy derivative</li>
+        <li>Right call for ingestion; nothing in indexing or search was wrong</li>
+        <li>Unit tests mocked storage and passed cleanly — they never asked what a browser actually receives</li>
+      </ul></div></div>
+    <div class="col"><span class="chip">B</span><div class="col-title">What viewing needed</div>
+      <div class="col-body"><ul>
+        <li>Both citation routes serve straight from <code>storage_key</code> — a PPTX-sourced citation handed the browser raw <code>.pptx</code> bytes, mislabeled <code>application/pdf</code></li>
+        <li>Invisible on paper: search and indexing worked perfectly; only clicking a citation was broken</li>
+        <li>Only surfaced by actually fetching <code>/api/document/{id}</code> and checking what <code>file</code> reported</li>
+      </ul></div></div>
+  </div>
+  <div class="callout"><span class="cal-label">The fix</span>Record the converted PDF's key <b>once, at conversion time</b>, in the manifest (<code>view_storage_key</code>) — search then makes a simple choice from data it already has, instead of an object-storage existence check on every citation render.</div>
+</section>
+
+<!-- SLIDE 5 — KEY DECISION 2 -->
+<section class="slide" data-no="05">
+  <div class="tag"><span class="idx">04</span><span class="label">Key design decision · 2 of 2</span></div>
+  <h1 class="headline">An SSRF fix that worked wasn't tight enough — so we<br><span class="hl">scoped the hole to one hostname</span></h1>
+  <p class="subtitle">The document fetcher has to reach one specific compose-internal address on purpose. Blocking every private range breaks that; allowing the whole private range lets an admin-token holder probe anything else on the network.</p>
+  <hr class="divider">
+  <div class="cols cols-2">
+    <div class="col"><span class="chip soft">A</span><div class="col-title">Pass one — real, not tight enough</div>
+      <div class="col-body"><ul>
+        <li>Block loopback / link-local / metadata, allow all of RFC1918 so <code>http://api:8000/...</code> keeps working</li>
+        <li>Verified live in both directions: dangerous addresses rejected, the deck's own fetch still worked</li>
+        <li>Still the wrong-sized exception — "needs one host" became "allow an entire private /8"</li>
+      </ul></div></div>
+    <div class="col"><span class="chip">B</span><div class="col-title">Pass two — scoped to the actual need</div>
+      <div class="col-body"><ul>
+        <li>Block every private/loopback/link-local/reserved range by default; allowlist the <b>one hostname</b> the app actually needs</li>
+        <li>Also pin the TCP connection to the already-validated IP — closes a DNS-rebinding window where the client would otherwise re-resolve at connect time</li>
+        <li>Re-verified both directions again after tightening, not assumed from pass one</li>
+      </ul></div></div>
+  </div>
+  <div class="callout"><span class="cal-label">Generalizes</span>Past SSRF: when a legitimate need punches a hole in a security boundary, scope the hole to the exact thing that needs through — <b>not the general category it falls under</b>. The gap between category and need is the residual exposure.</div>
+</section>
+
+<!-- SLIDE 6 — BENCHMARK INTEGRITY -->
+<section class="slide" data-no="06">
+  <div class="tag"><span class="idx">05</span><span class="label">Deep dive · benchmark integrity</span></div>
+  <h1 class="headline">A benchmark is production code for claims —<br>so it gets tested for <span class="hl">false passes</span></h1>
+  <p class="subtitle">The most useful test for a benchmark usually isn't the happy path. It's deliberately feeding it bad outcomes and asking whether it still turns green.</p>
+  <hr class="divider">
+  <div class="cols cols-2">
+    <div class="col"><span class="chip">A</span><div class="col-title">Caught before it shipped</div>
+      <div class="col-body"><ul>
+        <li>The resilience gate returned <code>no_loss=True</code> even fed already-indexed documents and two failing Docker commands — it only checked the final state</li>
+        <li>A "recall@10" score was computed as <code>citations[:10]</code> while the API returned 6 — a label isn't a transformation</li>
+        <li>A decoupling ratio passed after the backfill had already drained, because a <code>pending</code> row was treated as evidence of active work</li>
+      </ul></div></div>
+    <div class="col"><span class="chip">B</span><div class="col-title">The fix pattern</div>
+      <div class="col-body"><ul>
+        <li>Make overlap a hard <b>validity gate</b>, not an informational warning</li>
+        <li>Keep the full attempted cohort in the denominator, not just the successes</li>
+        <li>A required floor (<code>min_overlap_frac=0.5</code>) must not be loosenable from the command line down to zero</li>
+      </ul></div></div>
+  </div>
+  <div class="callout"><span class="cal-label">The real bar</span>A resilience proof needs four separate facts: something was <b>genuinely in flight</b>, the kill and restart <b>both really happened</b>, <b>nothing accepted was lost</b>, and a committed stage was <b>reused, not repeated</b>. "All rows are indexed now" proves none of those alone.</div>
+</section>
+
+<!-- SLIDE 7 — BOTTLENECK CHASE -->
+<section class="slide" data-no="07">
+  <div class="tag"><span class="idx">06</span><span class="label">Deep dive · chasing one throughput number</span></div>
+  <h1 class="headline">Four real fixes, one number that <span class="hl">mostly didn't move</span> —<br>because the ceiling kept changing floors</h1>
+  <p class="subtitle">Guessing "just add workers" would have stopped at the first plausible cause. Prefect's own run timestamps said otherwise, every time.</p>
+  <hr class="divider">
+  <div class="cols cols-4">
+    <div class="col"><span class="chip">1</span><div class="col-tag">Poll interval</div>
+      <div class="col-body">Flow runs sat 3–12s between <code>created</code> and <code>started</code> — Prefect's <code>serve()</code> polls Cloud every 10s by default, independent of replica count. Fix: <code>query_seconds=</code>.</div></div>
+    <div class="col"><span class="chip">2</span><div class="col-tag">Cold handshakes</div>
+      <div class="col-body">Faster pickup meant more concurrent runs opening fresh <code>QdrantClient</code>s at once → TLS timeouts falling into Prefect's expensive 2×60s retry. Fix: short local retry, narrowly scoped.</div></div>
+    <div class="col"><span class="chip">3</span><div class="col-tag">Thread oversubscription</div>
+      <div class="col-body">ONNX grabs all 18 visible cores per process; N concurrent ingest subprocesses each tried to claim all of them. Fix: <code>TEXT_EMBED_THREADS</code> cap, worker-only.</div></div>
+    <div class="col"><span class="chip">4</span><div class="col-tag">Shared lock, wrong layer</div>
+      <div class="col-body">Lock split + sub-batching were correct but didn't move the number — batches were too small to ever release the lock. Real fix: search's query embed runs its own local model, never through the shared service.</div></div>
+  </div>
+  <div class="callout"><span class="cal-label">The move each time</span>Don't fix the mechanism the plan guessed — <b>timestamp the actual pipeline</b> (Prefect already exposes it) and ask what's one level <i>above</i> the fix just made when the metric still doesn't budge.</div>
+</section>
+
+<!-- SLIDE 8 — CROSS-ENV RACE -->
+<section class="slide" data-no="08">
+  <div class="tag"><span class="idx">07</span><span class="label">Deep dive · shared state across environments</span></div>
+  <h1 class="headline">Local dev and Fly can share one queue —<br>but not <span class="hl">one worker's reach</span></h1>
+  <p class="subtitle">One Neon manifest and one Prefect workspace on purpose, so a source registered anywhere is searchable everywhere. Nothing stopped a Fly worker from claiming a row whose bytes only exist on a laptop's disk.</p>
+  <hr class="divider">
+  <div class="cols cols-2">
+    <div class="col"><span class="chip">A</span><div class="col-title">Two admission points, not one</div>
+      <div class="col-body">Suffixing deployment names by <code>FLY_APP_NAME</code> stopped a <i>new</i> run from crossing environments — but the dispatcher's own claim query still happily admitted old rows under the orphaned unsuffixed name. A <code>storage_env</code> column, checked at <code>db.claim_pending</code> — the same place every other admission invariant is checked — closed the actual race.</div></div>
+    <div class="col"><span class="chip">B</span><div class="col-title">The fix revealed the next cap</div>
+      <div class="col-body">Naming deployments per-environment orphaned the old shared ones, and Prefect Cloud's free-tier 5-deployment cap — undocumented anywhere in the project — then rejected registration with a <code>403</code>, silently swallowed by a bare <code>except: sleep 15; retry</code> loop.</div></div>
+  </div>
+  <div class="callout"><span class="cal-label">Same text, different cause</span>A <code>NoSuchKey</code> traceback from this race and an unrelated resilience FAIL looked identical — until checking one field (<code>STORAGE_PROVIDER</code>) showed only one run actually had two environments in play. <b>An error string names where something broke, not why.</b></div>
+</section>
+
+<!-- SLIDE 9 — RESULTS -->
+<section class="slide" data-no="09">
+  <div class="tag"><span class="idx">08</span><span class="label">Results</span></div>
+  <h1 class="headline">Retrieval quality clears every bar — throughput and error<br>rate don't, and <span class="hl">both are on the slide</span></h1>
+  <p class="subtitle">From <code>benchmark/_bench.json</code>, the artifact <code>bench.py</code> actually writes.</p>
+  <div class="grid6">
+    <div class="cell">
+      <div class="cell-label">Accept p95 · POST /admin/documents</div><div class="cell-target">target &lt; 300 ms</div>
+      <div class="cell-value">132.5 <span style="font-size:16px;">ms</span> <span class="badge badge-pass">PASS</span></div></div>
+    <div class="cell">
+      <div class="cell-label">Search p95 during backfill ÷ idle</div><div class="cell-target">target ≤ 1.3×</div>
+      <div class="cell-value">1.25× <span class="badge badge-pass">PASS</span></div></div>
+    <div class="cell">
+      <div class="cell-label">Recall@10 · 14 labeled queries</div><div class="cell-target">target ≥ 0.70</div>
+      <div class="cell-value">0.929 <span class="badge badge-pass">PASS</span></div></div>
+    <div class="cell">
+      <div class="cell-label">MRR@6 · rank-sensitive</div><div class="cell-target">target ≥ 0.60</div>
+      <div class="cell-value">0.788 <span class="badge badge-pass">PASS</span></div></div>
+    <div class="row-divider"></div>
+    <div class="cell fail">
+      <div class="cell-label">Ingest throughput</div><div class="cell-target">target ≥ 8 chunks/s</div>
+      <div class="cell-value fail">0.96 <span style="font-size:16px;">chunks/s</span> <span class="badge badge-fail">FAIL</span></div></div>
+    <div class="cell fail">
+      <div class="cell-label">Error rate · backfill cohort</div><div class="cell-target">target ≤ 1.0%</div>
+      <div class="cell-value fail">25.0% <span class="badge badge-fail">FAIL</span></div></div>
+    <div class="cell">
+      <div class="cell-label">Unit + benchmark self-tests</div><div class="cell-target">report</div>
+      <div class="cell-value">108 / 108</div></div>
+    <div class="cell">
+      <div class="cell-label">Cross-source in one answer</div><div class="cell-target">report</div>
+      <div class="cell-value" style="font-size:22px;">video + paper + deck</div></div>
+  </div>
+  <div class="callout"><span class="cal-label">The cause</span>Both misses trace to one thing: a single worker replica against <code>DISPATCH_MAX_INFLIGHT=10</code> admits far more concurrent work than it can execute inside a 20-document backfill. The documented fix (<code>--scale worker=2</code>) was never applied for this measured run.</div>
+</section>
+
+<!-- SLIDE 10 — RESILIENCE REGRESSION -->
+<section class="slide" data-no="10">
+  <div class="tag"><span class="idx">09</span><span class="label">Deep dive · resilience, run twice</span></div>
+  <h1 class="headline">A killed worker didn't lose any bytes — and still<br><span class="hl">failed the resilience gate, honestly</span></h1>
+  <p class="subtitle">An earlier clean pass ("10 indexed, 0 failed, 0 stuck") is recorded in this project's own history. Re-run in isolation under production defaults, it did not repeat.</p>
+  <hr class="divider">
+  <div class="cols cols-2">
+    <div class="col"><span class="chip">A</span><div class="col-title">What happened</div>
+      <div class="col-body">Of 10 documents in flight, 5 were mid-chunking at kill time. After <code>SIGKILL</code> + restart, only 3 resumed cleanly from checkpoint; 2 had already-committed work <b>redone instead of resumed</b>; 2 ended <code>failed</code> on a <code>NoSuchKey</code> error that doesn't originate anywhere in this codebase.</div></div>
+    <div class="col"><span class="chip">B</span><div class="col-title">What was actually true</div>
+      <div class="col-body">Calling <code>storage.get_bytes()</code> by hand against the running container, for every failed document, returned the full file <b>immediately</b>. The bytes were never lost — the failure sits in the orchestration/retry layer, most likely Prefect Cloud's own post-kill task retry interacting with <code>RECONCILE_STALE_S</code>.</div></div>
+  </div>
+  <div class="callout"><span class="cal-label">Scored anyway</span>A plain <b>FAIL</b>, not softened: the rubric's bar is "0 dropped → resumes → finished stages not re-run," and neither run met it — even though the data-loss claim doesn't hold up under direct verification. The honest report and the comfortable one are different documents.</div>
+</section>
+
+<!-- SLIDE 11 — THINK LIKE AN FDE -->
+<section class="slide" data-no="11">
+  <div class="tag"><span class="idx">10</span><span class="label">Think like a Forward Deployed Engineer</span></div>
+  <h1 class="headline">Every review round found something the last round's<br>fix didn't cover — <span class="hl">that's a pattern, not noise</span></h1>
+  <hr class="divider">
+  <div class="cols cols-2 cols-2x2">
+    <div class="col"><span class="chip">1</span><div class="col-tag">Literal beats reasonable</div>
+      <div class="col-body">A rule stated as a non-negotiable isn't the place to look for an implicit exception, even when the exception feels sound. Judgment applies to <i>how</i> to satisfy the rule, not <i>whether</i> it applies.</div></div>
+    <div class="col"><span class="chip">2</span><div class="col-tag">Boundaries mean every path</div>
+      <div class="col-body">"Never in the request path" turned out to mean never calling the scheduler over the network, not just never importing a heavy library. A boundary named by one example is a boundary around the whole category.</div></div>
+    <div class="col"><span class="chip">3</span><div class="col-tag">Test what's literally claimed</div>
+      <div class="col-body">"Verified live, mid-conversion crash" had only tested a crash <i>after</i> conversion completed. The stronger, literal test — an actual kill mid-conversion — found the real, narrower guarantee.</div></div>
+    <div class="col"><span class="chip">4</span><div class="col-tag">A fix's blast radius outlives the bug</div>
+      <div class="col-body">Removing one fallback surfaced two new bugs in sequence, each invisible from the changed file alone — visible only by asking what else in the system depended on the thing just removed.</div></div>
+  </div>
+</section>
+
+<!-- SLIDE 12 — WHAT SHIPS -->
+<section class="slide" data-no="12">
+  <div class="tag"><span class="idx">11</span><span class="label">What ships</span></div>
+  <h1 class="headline">A system whose numbers can be re-run —<br><span class="hl">including the ones that aren't flattering</span></h1>
+  <hr class="divider">
+  <div class="cols cols-2">
+    <div class="col"><span class="chip">A</span><div class="col-title">Deliverables</div>
+      <div class="col-body"><ul>
+        <li><b>Deployed on Fly.io</b> — cross-source, answering the same query with video + paper + deck citations on both localhost and the public URL</li>
+        <li><b>108 / 108 tests</b> — 89 repository unit tests + 19 benchmark self-tests, run against the built image</li>
+        <li><b>Benchmark harness</b> — <code>bench.py</code>, <code>calibrate_thresholds.py</code>, <code>eval.py</code>, every figure traced to a JSON in <code>benchmark/</code></li>
+        <li><b>14 labeled golden queries</b> across video, paper, and deck, each grounded in real extracted content</li>
+      </ul></div></div>
+    <div class="col"><span class="chip">B</span><div class="col-title">What we'd do next, in order</div>
+      <div class="col-body"><ul>
+        <li><b>Isolate the resilience regression</b> — re-run with <code>RECONCILE_STALE_S</code> lowered to separate this app's checkpoint-resume from Prefect Cloud's own post-kill retry</li>
+        <li><b>Scale workers and re-measure</b> — <code>--scale worker=2</code> against the actual documented bottleneck, not a guess</li>
+        <li><b>A lease token at admission</b> — closes the duplicate-run race fully, not just its worst consequence</li>
+        <li><b>Per-corpus quota in fusion</b> — closes the two remaining mixed-query recall misses</li>
+      </ul></div></div>
+  </div>
+  <div class="callout"><span class="cal-label">The claim</span>Not that every gate is green. The claim is that <b>every number here was produced by a script anyone can run again</b> — and where the number is inconvenient, it's on the slide anyway.</div>
+  <div class="footer-source">Hari Chidambaram · Assignment 3, Moment Search at Scale · Forward Deployed Engineering Bootcamp · July 30, 2026</div>
+</section>
+
+</div>
+</body>
+</html>
